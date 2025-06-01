@@ -61,14 +61,16 @@ class EbbinghausLLM:
 
     def get_detailed_token_weights(self, token_ids: torch.Tensor) -> Dict:
         """获取每个token的详细权重信息"""
-        tokens = self.tokenizer.convert_ids_to_tokens(token_ids.cpu().numpy())
-        token_texts = [self.tokenizer.decode([tid]) for tid in token_ids.cpu().numpy()]
-        seq_len = len(tokens)
+        # 避免多次device转换，一次性转换到CPU用于tokenizer
+        token_ids_list = token_ids.tolist() if not token_ids.is_cuda else token_ids.cpu().tolist()
+        tokens = self.tokenizer.convert_ids_to_tokens(token_ids_list)
+        token_texts = [self.tokenizer.decode([tid]) for tid in token_ids_list]
+        seq_len = token_ids.shape[0]
         
         detailed_info = {
             'tokens': tokens,
             'token_texts': token_texts,
-            'token_ids': token_ids.cpu().numpy().tolist(),
+            'token_ids': token_ids_list,
             'layers_info': {}
         }
         
@@ -298,8 +300,8 @@ class EbbinghausLLM:
             # 使用torch.stack一次性处理所有层
             stacked_weights = torch.stack(valid_weights)  # [num_layers, seq_len]
             
-            # 使用int8计算节省内存
-            low_weight_mask = (stacked_weights < threshold).to(torch.int8).sum(dim=0)  # [seq_len]
+            # 使用tensor操作计算，保持设备一致性
+            low_weight_mask = (stacked_weights < threshold).sum(dim=0)  # [seq_len]
             
             # 直接生成float mask，避免多次类型转换
             attention_mask = (low_weight_mask < min_layers).float().unsqueeze(0)
@@ -324,7 +326,7 @@ class EbbinghausLLM:
         
         if valid_weights:
             stacked_weights = torch.stack(valid_weights)
-            low_weight_mask = (stacked_weights < threshold).to(torch.int8).sum(dim=0)
+            low_weight_mask = (stacked_weights < threshold).sum(dim=0)
             new_mask = (low_weight_mask < min_layers).float().unsqueeze(0)
             return new_mask
         
@@ -434,7 +436,7 @@ class EbbinghausLLM:
                 break
             
             # 更新输入（只传入新token）
-            current_ids = torch.tensor([[next_token_id]], device=self.device)
+            current_ids = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
             
             if verbose and (step + 1) % 10 == 0:
                 print(f"已生成 {step + 1} tokens")
@@ -444,7 +446,7 @@ class EbbinghausLLM:
         # 构建完整序列
         full_ids = torch.cat([
             input_ids[0],
-            torch.tensor(generated_ids, device=self.device)
+            torch.tensor(generated_ids, device=self.device, dtype=torch.long)
         ])
         
         # 解码
@@ -530,7 +532,8 @@ class EbbinghausLLM:
                 
                 # 记录注意力历史（如果需要）
                 if return_attention_weights and attention_weights_history is not None:
-                    attention_data = [attn.squeeze().cpu().numpy().tolist() for attn in layer_attentions]
+                    # 保持GPU tensor，避免CPU转换
+                    attention_data = [attn.squeeze().detach() for attn in layer_attentions]
                     attention_weights_history.append({
                         'step': step,
                         'seq_len': seq_len,
@@ -554,7 +557,7 @@ class EbbinghausLLM:
                 break
             
             # 更新输入（只传入新token）
-            current_ids = torch.tensor([[next_token_id]], device=self.device)
+            current_ids = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
             
             # 每个token都必须进行时间步进（艾宾浩斯核心）
             self.memory_manager.step_all_memories()
@@ -571,7 +574,7 @@ class EbbinghausLLM:
         # 构建完整序列
         full_ids = torch.cat([
             input_ids[0],
-            torch.tensor(generated_ids, device=self.device)
+            torch.tensor(generated_ids, device=self.device, dtype=torch.long)
         ])
         
         # 解码
@@ -668,7 +671,8 @@ class EbbinghausLLM:
                 
                 # 记录注意力历史（如果需要）
                 if return_attention_weights and attention_weights_history is not None:
-                    attention_data = [attn.squeeze().cpu().numpy().tolist() for attn in layer_attentions]
+                    # 保持GPU tensor，避免CPU转换
+                    attention_data = [attn.squeeze().detach() for attn in layer_attentions]
                     attention_weights_history.append({
                         'step': step,
                         'seq_len': seq_len,
@@ -692,7 +696,7 @@ class EbbinghausLLM:
                 break
             
             # 更新输入（只传入新token）
-            current_ids = torch.tensor([[next_token_id]], device=self.device)
+            current_ids = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
             
             # 每个token都必须进行时间步进（艾宾浩斯核心）
             self.memory_manager.step_all_memories()
@@ -709,7 +713,7 @@ class EbbinghausLLM:
         # 构建完整序列
         full_ids = torch.cat([
             input_ids[0],
-            torch.tensor(generated_ids, device=self.device)
+            torch.tensor(generated_ids, device=self.device, dtype=torch.long)
         ])
         
         # 解码
