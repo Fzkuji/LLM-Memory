@@ -13,7 +13,7 @@ import argparse
 
 def main():
     parser = argparse.ArgumentParser(description="Ebbinghaus记忆增强LLM演示")
-    parser.add_argument("--mode", choices=["baseline", "soft_delete", "sparse_attention"], 
+    parser.add_argument("--mode", choices=["baseline", "soft_delete", "sparse_attention", "sparse_delete"], 
                        default="baseline", help="生成模式")
     parser.add_argument("--prompt", type=str, default="请详细解释现代大语言模型（LLMs）的工作原理，包括从训练到推理的完整流程，涉及的关键技术，以及它们是如何理解和生成人类语言的？",
                        help="输入提示词")
@@ -40,10 +40,10 @@ def main():
     
     if args.compare:
         # 对比模式
-        print(f"\n🔄 对比三种模式 (prompt: {args.prompt})")
+        print(f"\n🔄 对比四种模式 (prompt: {args.prompt})")
         print("=" * 60)
         
-        modes = ["baseline", "soft_delete", "sparse_attention"]
+        modes = ["baseline", "soft_delete", "sparse_attention", "sparse_delete"]
         results = {}
         
         for mode in modes:
@@ -69,13 +69,18 @@ def main():
                 print(f"耗时: {result['generation_time']:.2f}秒")
                 print(f"速度: {result['num_tokens']/result['generation_time']:.2f} tokens/秒")
                 
-                # 显示记忆统计
-                if mode != "baseline" and 'memory_stats' in result:
-                    layer_0_stats = result['memory_stats'].get('layer_0', {})
-                    if layer_0_stats:
-                        avg_retention = layer_0_stats.get('avg_retention', 0)
-                        num_tokens = layer_0_stats.get('num_tokens', 0)
-                        print(f"记忆状态: {num_tokens} tokens, 平均保持率 {avg_retention:.4f}")
+                # 显示记忆统计和删除信息
+                if mode != "baseline":
+                    if 'memory_stats' in result:
+                        layer_0_stats = result['memory_stats'].get('layer_0', {})
+                        if layer_0_stats:
+                            avg_retention = layer_0_stats.get('avg_retention', 0)
+                            num_tokens = layer_0_stats.get('num_tokens', 0)
+                            print(f"记忆状态: {num_tokens} tokens, 平均保持率 {avg_retention:.4f}")
+                    
+                    # 显示删除信息（仅sparse_delete模式）
+                    if mode == "sparse_delete" and 'total_removed_tokens' in result:
+                        print(f"删除token数: {result['total_removed_tokens']}")
                 
             except Exception as e:
                 print(f"❌ 错误: {e}")

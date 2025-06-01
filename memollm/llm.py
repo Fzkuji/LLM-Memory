@@ -381,6 +381,233 @@ class EbbinghausLLM:
         
         return attention_mask
 
+    def _remove_low_weight_tokens(self, past_key_values, memory_weights, full_input_ids, threshold=0.01):
+        """直接删除低权重token而不是使用mask"""
+        if past_key_values is None or not memory_weights:
+            return past_key_values, full_input_ids, []
+        
+        seq_len = full_input_ids.shape[1]
+        
+        # 获取所有层的平均权重来决定删除哪些token
+        avg_weights = torch.zeros(seq_len, device=self.device)
+        valid_layer_count = 0
+        
+        for layer_weights in memory_weights:
+            if layer_weights.shape[0] >= seq_len:
+                avg_weights += layer_weights[:seq_len]
+                valid_layer_count += 1
+        
+        if valid_layer_count > 0:
+            avg_weights = avg_weights / valid_layer_count
+        
+        # 找到需要保留的token位置
+        keep_mask = avg_weights >= threshold
+        keep_indices = torch.where(keep_mask)[0]
+        removed_indices = torch.where(~keep_mask)[0].tolist()
+        
+        if len(keep_indices) == seq_len:
+            # 没有token需要删除
+            return past_key_values, full_input_ids, []
+        
+        if len(keep_indices) == 0:
+            # 不能删除所有token，保留最后一个
+            keep_indices = torch.tensor([seq_len - 1], device=self.device)
+            removed_indices = list(range(seq_len - 1))
+        
+        # 更新input_ids
+        new_input_ids = full_input_ids[:, keep_indices]
+        
+        # 更新past_key_values
+        new_past_key_values = []
+        for layer_idx, (key_cache, value_cache) in enumerate(past_key_values):
+            # key_cache和value_cache的形状通常是[batch_size, num_heads, seq_len, head_dim]
+            new_key = key_cache[:, :, keep_indices, :]
+            new_value = value_cache[:, :, keep_indices, :]
+            new_past_key_values.append((new_key, new_value))
+        
+        # 确保返回正确的格式
+        new_past_key_values = tuple(new_past_key_values)
+        
+        return new_past_key_values, new_input_ids, removed_indices
+    
+    @torch.no_grad()
+    def generate_sparse_delete(
+        self,
+        input_text: str,
+        max_new_tokens: int = 100,
+        temperature: float = 0.7,
+        do_sample: bool = True,
+        top_k: int = 0,
+        top_p: float = 0.9,
+        return_attention_weights: bool = False,
+        verbose: bool = True,
+        force_exact_length: bool = False,
+        deletion_threshold: float = 0.01,
+        deletion_interval: int = 5,  # 每隔多少步删除一次
+    ):
+        """新的稀疏实现：直接删除低权重token而不是mask"""
+        # 准备输入
+        inputs = self.prepare_input(input_text)
+        input_ids = inputs["input_ids"]
+        
+        # 初始化记忆管理器
+        self.memory_manager = EbbinghausMemoryManager(self.num_layers)
+        
+        start_time = time.time()
+        if verbose:
+            print(f"开始稀疏删除生成，输入长度: {input_ids.shape[1]}")
+        
+        generated_ids = []
+        full_input_ids = input_ids.clone()  # 保持完整的input_ids历史
+        past_key_values = None
+        attention_weights_history = [] if return_attention_weights else None
+        total_removed = 0
+        
+        for step in range(max_new_tokens):
+            current_seq_len = full_input_ids.shape[1]
+            
+            # 获取记忆权重
+            memory_weights = self.memory_manager.get_all_layer_weights_batch(
+                current_seq_len, self.device, self.model.dtype
+            )
+            
+            # 删除低权重token（按间隔进行）
+            if step > 0 and step % deletion_interval == 0:  # 按指定间隔删除
+                old_past_kv, full_input_ids, removed_indices = self._remove_low_weight_tokens(
+                    past_key_values, memory_weights, full_input_ids, deletion_threshold
+                )
+                
+                if removed_indices:
+                    total_removed += len(removed_indices)
+                    if verbose and step < 5:
+                        print(f"Step {step}: 删除了 {len(removed_indices)} 个token, 剩余 {full_input_ids.shape[1]} 个token")
+                    
+                    # 如果删除了token，重置past_key_values以避免格式问题
+                    past_key_values = None
+                    
+                    # 批量更新记忆管理器（优化版）
+                    removed_set = set(removed_indices)  # 使用集合加速查找
+                    for layer_idx in range(self.num_layers):
+                        layer_memories = self.memory_manager.memories[layer_idx]
+                        if not layer_memories:
+                            continue
+                        
+                        # 一次性构建新的记忆映射
+                        new_memories = {}
+                        offset_map = {}  # 缓存偏移量计算
+                        offset = 0
+                        
+                        for pos in range(full_input_ids.shape[1] + len(removed_indices)):
+                            if pos in removed_set:
+                                offset += 1
+                            else:
+                                offset_map[pos] = pos - offset
+                        
+                        # 批量重映射
+                        for old_pos, memory in layer_memories.items():
+                            if old_pos not in removed_set and old_pos in offset_map:
+                                new_memories[offset_map[old_pos]] = memory
+                        
+                        self.memory_manager.memories[layer_idx] = new_memories
+            
+            # 前向传播
+            if step == 0 or past_key_values is None:
+                # 第一步或删除token后需要传入完整序列
+                current_ids = full_input_ids
+            else:
+                # 只传入最新生成的token
+                current_ids = torch.tensor([[generated_ids[-1]]], device=self.device, dtype=torch.long)
+            
+            outputs = self.model(
+                input_ids=current_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_attentions=True,  # 必须为True以更新记忆
+                return_dict=True
+            )
+            
+            # 更新past_key_values
+            past_key_values = outputs.past_key_values
+            
+            # 更新记忆
+            if outputs.attentions is not None:
+                layer_attentions = [
+                    layer_attn[0, :, -1, :].mean(dim=0, keepdim=True) 
+                    for layer_attn in outputs.attentions
+                ]
+                
+                # 更新所有层的记忆
+                self.memory_manager.update_all_layer_memories_batch(layer_attentions)
+                
+                # 记录注意力历史
+                if return_attention_weights and attention_weights_history is not None:
+                    attention_data = [attn.squeeze().detach() for attn in layer_attentions]
+                    attention_weights_history.append({
+                        'step': step,
+                        'seq_len': full_input_ids.shape[1],
+                        'layer_weights': attention_data
+                    })
+            
+            # 获取最后一个token的logits
+            logits = outputs.logits[0, -1, :]
+            
+            # 采样下一个token
+            next_token_id = self._sample_next_token_fast(
+                logits, temperature, do_sample, top_k, top_p
+            )
+            
+            generated_ids.append(next_token_id)
+            
+            # 检查是否结束
+            if next_token_id == self.tokenizer.eos_token_id and not force_exact_length:
+                if verbose:
+                    print(f"遇到EOS token，提前结束")
+                break
+            
+            # 将新token添加到完整序列中
+            new_token_tensor = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
+            full_input_ids = torch.cat([full_input_ids, new_token_tensor], dim=1)
+            
+            # 时间步进
+            self.memory_manager.step_all_memories()
+            
+            if verbose and (step + 1) % 10 == 0:
+                print(f"已生成 {step + 1} tokens, 删除了 {total_removed} 个token")
+        
+        generation_time = time.time() - start_time
+        
+        # 构建完整序列用于解码
+        original_input_len = input_ids.shape[1]
+        decode_ids = torch.cat([
+            input_ids[0],
+            torch.tensor(generated_ids, device=self.device, dtype=torch.long)
+        ])
+        
+        # 解码
+        full_text = self.tokenizer.decode(decode_ids, skip_special_tokens=True)
+        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        
+        if verbose:
+            print(f"生成完成，用时: {generation_time:.2f}秒")
+            print(f"总共删除了 {total_removed} 个token")
+        
+        # 获取token权重信息
+        token_weights_info = None
+        if return_attention_weights:
+            token_weights_info = self.get_detailed_token_weights(decode_ids)
+        
+        return {
+            'full_text': full_text,
+            'generated_text': generated_text,
+            'num_tokens': len(generated_ids),
+            'generation_time': generation_time,
+            'memory_stats': self.memory_manager.get_all_stats(),
+            'token_weights': token_weights_info,
+            'attention_weights_history': attention_weights_history,
+            'total_removed_tokens': total_removed,
+            'generation_mode': 'sparse_delete'
+        }
+
     @torch.no_grad()
     def generate_baseline(
         self,
@@ -770,8 +997,13 @@ class EbbinghausLLM:
                 input_text, max_new_tokens, temperature, do_sample, top_k, top_p, 
                 return_attention_weights, verbose, force_exact_length
             )
+        elif generation_mode == "sparse_delete":
+            return self.generate_sparse_delete(
+                input_text, max_new_tokens, temperature, do_sample, top_k, top_p, 
+                return_attention_weights, verbose, force_exact_length
+            )
         else:
-            raise ValueError(f"Unknown generation_mode: {generation_mode}")
+            raise ValueError(f"Unknown generation_mode: {generation_mode}. Available modes: baseline, soft_delete, sparse_attention, sparse_delete")
 
     @torch.no_grad()
     def generate_standard(
