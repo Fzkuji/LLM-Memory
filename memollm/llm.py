@@ -15,19 +15,20 @@ class EbbinghausLLM:
 
     def __init__(self, model_name="Qwen/Qwen2.5-0.5B-Instruct", device=None):
         print(f"初始化模型: {model_name}")
-        
-        # 清理CUDA缓存
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print(f"CUDA可用显存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 
         # 加载分词器
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # 尝试不同的模型加载策略
-        self.model = self._load_model_with_fallback(model_name, device)
+        # 加载模型
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto" if device is None else device,
+            trust_remote_code=True,
+            attn_implementation="eager"
+        )
 
         # 获取设备和模型信息
         self.device = next(self.model.parameters()).device
@@ -43,61 +44,6 @@ class EbbinghausLLM:
         self._last_update_step = -1
         self._cached_attention_mask = None
         self._cached_mask_seq_len = 0
-        
-    def _load_model_with_fallback(self, model_name: str, device=None):
-        """使用回退策略加载模型"""
-        loading_strategies = [
-            {
-                "name": "默认加载",
-                "kwargs": {
-                    "torch_dtype": torch.float16,
-                    "device_map": "auto" if device is None else device,
-                    "trust_remote_code": True,
-                    "attn_implementation": "eager"
-                }
-            },
-            {
-                "name": "8bit量化",
-                "kwargs": {
-                    "load_in_8bit": True,
-                    "device_map": "auto",
-                    "trust_remote_code": True,
-                    "attn_implementation": "eager"
-                }
-            },
-            {
-                "name": "4bit量化",
-                "kwargs": {
-                    "load_in_4bit": True,
-                    "device_map": "auto",
-                    "trust_remote_code": True,
-                    "attn_implementation": "eager"
-                }
-            },
-            {
-                "name": "CPU加载",
-                "kwargs": {
-                    "torch_dtype": torch.float16,
-                    "device_map": "cpu",
-                    "trust_remote_code": True,
-                    "attn_implementation": "eager"
-                }
-            }
-        ]
-        
-        for strategy in loading_strategies:
-            try:
-                print(f"尝试{strategy['name']}...")
-                model = AutoModelForCausalLM.from_pretrained(model_name, **strategy['kwargs'])
-                print(f"✅ {strategy['name']}成功")
-                return model
-            except Exception as e:
-                print(f"❌ {strategy['name']}失败: {str(e)[:100]}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue
-        
-        raise RuntimeError("所有模型加载策略都失败了")
 
     def prepare_input(self, text: str) -> Dict:
         """准备模型输入"""
