@@ -414,16 +414,42 @@ class EbbinghausLLM:
             keep_indices = torch.tensor([seq_len - 1], device=self.device)
             removed_indices = list(range(seq_len - 1))
         
+        # 确保 keep_indices 是有序的，避免索引错误
+        keep_indices, _ = torch.sort(keep_indices)
+        
+        # 限制删除的token数量，避免删除太多导致问题
+        max_remove = int(seq_len * 0.5)  # 最多删除50%的token
+        if len(removed_indices) > max_remove:
+            # 只删除权重最低的部分token
+            weights_to_remove = avg_weights[~keep_mask]
+            _, lowest_indices = torch.topk(weights_to_remove, max_remove, largest=False)
+            actual_remove_indices = torch.tensor(removed_indices, device=self.device)[lowest_indices]
+            keep_mask = torch.ones(seq_len, dtype=torch.bool, device=self.device)
+            keep_mask[actual_remove_indices] = False
+            keep_indices = torch.where(keep_mask)[0]
+            keep_indices, _ = torch.sort(keep_indices)
+            removed_indices = actual_remove_indices.tolist()
+        
         # 更新input_ids
         new_input_ids = full_input_ids[:, keep_indices]
         
-        # 更新past_key_values
+        # 安全地更新past_key_values
         new_past_key_values = []
-        for layer_idx, (key_cache, value_cache) in enumerate(past_key_values):
-            # key_cache和value_cache的形状通常是[batch_size, num_heads, seq_len, head_dim]
-            new_key = key_cache[:, :, keep_indices, :]
-            new_value = value_cache[:, :, keep_indices, :]
-            new_past_key_values.append((new_key, new_value))
+        try:
+            for layer_idx, (key_cache, value_cache) in enumerate(past_key_values):
+                # 检查维度
+                if key_cache.shape[2] != seq_len or value_cache.shape[2] != seq_len:
+                    # 维度不匹配，跳过删除
+                    return past_key_values, full_input_ids, []
+                
+                # key_cache和value_cache的形状通常是[batch_size, num_heads, seq_len, head_dim]
+                new_key = key_cache[:, :, keep_indices, :]
+                new_value = value_cache[:, :, keep_indices, :]
+                new_past_key_values.append((new_key, new_value))
+        except Exception as e:
+            # 如果出现错误，返回原始值
+            print(f"删除token时出错: {e}")
+            return past_key_values, full_input_ids, []
         
         # 确保返回正确的格式
         new_past_key_values = tuple(new_past_key_values)
