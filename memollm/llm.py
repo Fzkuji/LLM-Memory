@@ -264,8 +264,10 @@ class EbbinghausLLM:
         
         # Process each layer independently
         for layer_idx, weights in enumerate(memory_weights):
-            if weights.shape[0] >= current_seq_len:
-                layer_weights = weights[:current_seq_len]
+            # Use the minimum of weights length and current_seq_len
+            actual_len = min(weights.shape[0], current_seq_len)
+            if actual_len > 0:
+                layer_weights = weights[:actual_len]
                 # Find positions where weight is below threshold for this layer
                 low_weight_positions = (layer_weights < threshold).nonzero(as_tuple=True)[0].tolist()
                 tokens_to_delete_per_layer.append(low_weight_positions)
@@ -407,6 +409,27 @@ class EbbinghausLLM:
                     tokens_to_delete_per_layer = self._identify_tokens_to_delete_per_layer(
                         current_seq_len, memory_weights, hard_delete_threshold
                     )
+                    
+                    # DEBUG: 显示权重分布和删除统计
+                    if verbose and step < 3:
+                        layer0_weights = memory_weights[0] if memory_weights else None
+                        if layer0_weights is not None:
+                            min_weight = layer0_weights.min().item()
+                            max_weight = layer0_weights.max().item()
+                            below_threshold = (layer0_weights < hard_delete_threshold).sum().item()
+                            zero_weights = (layer0_weights == 0.0).sum().item()
+                            print(f"  DEBUG Step {step}: Layer 0 weights range: {min_weight:.6f}-{max_weight:.6f}, below {hard_delete_threshold}: {below_threshold}, zero weights: {zero_weights}")
+                            print(f"  DEBUG: current_seq_len={current_seq_len}, layer0_weights.shape={layer0_weights.shape}")
+                            print(f"  DEBUG: Tokens to delete per layer (前5层): {[len(layer) for layer in tokens_to_delete_per_layer[:5]]}")
+                            if tokens_to_delete_per_layer and len(tokens_to_delete_per_layer[0]) > 0:
+                                print(f"  DEBUG: Layer 0 delete positions: {tokens_to_delete_per_layer[0][:10]}")
+                            
+                            # 检查记忆对象的状态
+                            layer0_memories = self.memory_manager.layer_memories[0]
+                            if layer0_memories:
+                                sample_pos = list(layer0_memories.keys())[0]
+                                sample_mem = layer0_memories[sample_pos]
+                                print(f"  DEBUG: Sample memory - pos={sample_pos}, strength={sample_mem.strength:.3f}, time_steps={sample_mem.time_steps:.3f}, weight={sample_mem.get_retention_weight():.6f}")
                     
                     # Perform hard deletion for each layer independently
                     layer_deletions = 0
