@@ -3,11 +3,11 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 import time
-from typing import Dict, List, Optional, Union, Tuple, Any
+from typing import Dict, List, Optional, Any
 import warnings
 
 from .memory import EbbinghausMemoryManager
-from .model import VariableLengthCache, VariableLengthModel
+# from .model import VariableLengthCache, VariableLengthModel  # 不再使用
 
 warnings.filterwarnings('ignore')
 
@@ -221,94 +221,7 @@ class EbbinghausLLM:
             self._cached_seq_len = seq_len
         
         return self._cached_memory_weights
-    
-    
-    def _apply_memory_to_past_kv_enhanced(
-        self, past_key_values: Optional[Union[Tuple, DynamicCache]], memory_weights: List[torch.Tensor]
-    ) -> Optional[Union[Tuple, DynamicCache]]:
-        """Apply memory weights without threshold clamping (enhanced version)"""
-        if past_key_values is None or not memory_weights:
-            return past_key_values
-        
-        # Handle DynamicCache objects
-        if isinstance(past_key_values, DynamicCache):
-            # Apply weights to DynamicCache
-            max_layers = min(len(past_key_values.key_cache), len(memory_weights))
-            
-            for layer_idx in range(max_layers):
-                weights = memory_weights[layer_idx]
-                key_cache = past_key_values.key_cache[layer_idx]
-                value_cache = past_key_values.value_cache[layer_idx]
-                
-                if key_cache is not None and weights.shape[0] == key_cache.shape[2]:
-                    # Apply weights directly without clamping
-                    weights_expanded = weights.view(1, 1, -1, 1)
-                    
-                    # Apply to both key and value cache
-                    key_cache.mul_(weights_expanded)
-                    value_cache.mul_(weights_expanded)
-        else:
-            # Handle tuple format
-            max_layers = min(len(past_key_values), len(memory_weights))
-            
-            for layer_idx in range(max_layers):
-                weights = memory_weights[layer_idx]
-                layer_cache = past_key_values[layer_idx]
-                
-                # 检查layer_cache是否是tuple
-                if isinstance(layer_cache, tuple) and len(layer_cache) == 2:
-                    key_cache, value_cache = layer_cache
-                    
-                    if key_cache is not None and hasattr(key_cache, 'shape') and weights.shape[0] == key_cache.shape[2]:
-                        # Apply weights directly without clamping
-                        weights_expanded = weights.view(1, 1, -1, 1)
-                        
-                        # Apply to both key and value cache
-                        key_cache.mul_(weights_expanded)
-                        if value_cache is not None:
-                            value_cache.mul_(weights_expanded)
-                else:
-                    # 可能是其他格式，跳过
-                    continue
-        
-        return past_key_values
-    
-    def _generate_per_layer_attention_masks(self, current_seq_len: int, tokens_to_delete_per_layer: List[List[int]], device: torch.device) -> List[torch.Tensor]:
-        """Generate per-layer attention masks to soft-mask deleted tokens instead of hard deletion"""
-        if not tokens_to_delete_per_layer:
-            return []
-        
-        per_layer_masks = []
-        
-        for layer_idx, tokens_to_delete in enumerate(tokens_to_delete_per_layer):
-            if layer_idx < self.num_layers:
-                # Create attention mask for this layer: 1 for attend, 0 for mask
-                layer_mask = torch.ones(current_seq_len, dtype=torch.bool, device=device)
-                
-                # Mask the tokens this layer wants to delete
-                for pos in tokens_to_delete:
-                    if 0 <= pos < current_seq_len:
-                        layer_mask[pos] = False
-                
-                # Convert to additive attention mask format (0 for attend, -inf for mask)
-                # Shape: [1, 1, 1, seq_len] for broadcasting to [batch, heads, seq_len, seq_len]
-                additive_mask = torch.where(
-                    layer_mask, 
-                    0.0, 
-                    float('-inf')
-                ).unsqueeze(0).unsqueeze(0).unsqueeze(0)
-                
-                per_layer_masks.append(additive_mask)
-                
-                if layer_idx < 3:  # Debug info for first few layers
-                    deleted_count = len(tokens_to_delete)
-                    print(f"  DEBUG: Layer {layer_idx} mask: {deleted_count} tokens masked")
-            else:
-                # For layers beyond what we have deletion info, create empty mask (attend to all)
-                empty_mask = torch.zeros(1, 1, 1, current_seq_len, device=device)
-                per_layer_masks.append(empty_mask)
-        
-        return per_layer_masks
+
     
     def _adjust_memory_per_layer(self, tokens_to_delete_per_layer: List[List[int]]) -> None:
         """Adjust memory manager after layer-specific token deletion"""
@@ -338,85 +251,6 @@ class EbbinghausLLM:
                     new_layer_memories[new_pos] = memory
             
             self.memory_manager.layer_memories[layer_idx] = new_layer_memories
-    
-    def _delete_tokens_from_sequence(self, token_ids: torch.Tensor, tokens_to_delete: List[int]) -> torch.Tensor:
-        """Delete tokens from input sequence"""
-        if not tokens_to_delete or token_ids.shape[1] == 0:
-            return token_ids
-        
-        # Sort positions to delete
-        positions_to_delete = sorted(set(tokens_to_delete), reverse=True)
-        
-        # Create a mask for positions to keep
-        seq_len = token_ids.shape[1]
-        keep_mask = torch.ones(seq_len, dtype=torch.bool, device=token_ids.device)
-        
-        for pos in positions_to_delete:
-            if 0 <= pos < seq_len:
-                keep_mask[pos] = False
-        
-        # Return only the positions we want to keep
-        return token_ids[:, keep_mask]
-    
-    def _forward_with_per_layer_masks(self, input_ids, past_key_values=None, per_layer_masks=None, output_attentions=False):
-        """Custom forward method with per-layer attention masks for soft deletion"""
-        
-        # 使用标准的模型forward，但修改attention mask
-        # 这比重新实现整个forward简单得多
-        
-        # 我们将通过monkey patching每层的attention来实现per-layer mask
-        original_forwards = []
-        
-        try:
-            # 保存原始的layer forward方法并替换为自定义版本
-            for layer_idx, layer in enumerate(self.model.model.layers):
-                if layer_idx < len(per_layer_masks):
-                    layer_mask = per_layer_masks[layer_idx]
-                    
-                    # 保存原始方法
-                    original_forward = layer.forward
-                    original_forwards.append(original_forward)
-                    
-                    # 创建带有特定mask的wrapper
-                    def create_masked_forward(original_func, mask):
-                        def masked_forward(hidden_states, attention_mask=None, **kwargs):
-                            # 如果有layer-specific mask，将其与现有mask结合
-                            if mask is not None and mask.shape[-1] > 0:
-                                if attention_mask is not None:
-                                    # 结合现有mask和layer-specific mask
-                                    combined_mask = attention_mask + mask.expand_as(attention_mask)
-                                else:
-                                    # 使用layer-specific mask
-                                    batch_size = hidden_states.shape[0]
-                                    seq_len = hidden_states.shape[1]
-                                    combined_mask = mask.expand(batch_size, 1, seq_len, -1)
-                                
-                                kwargs['attention_mask'] = combined_mask
-                            
-                            return original_func(hidden_states, attention_mask=attention_mask, **kwargs)
-                        return masked_forward
-                    
-                    # 替换layer的forward方法
-                    layer.forward = create_masked_forward(original_forward, layer_mask)
-                else:
-                    original_forwards.append(layer.forward)
-            
-            # 现在调用标准的model forward
-            outputs = self.model(
-                input_ids=input_ids,
-                past_key_values=past_key_values,
-                output_attentions=output_attentions,
-                use_cache=True,
-                return_dict=True
-            )
-            
-            return outputs
-            
-        finally:
-            # 恢复原始的forward方法
-            for layer_idx, layer in enumerate(self.model.model.layers):
-                if layer_idx < len(original_forwards):
-                    layer.forward = original_forwards[layer_idx]
     
     
     def _identify_tokens_to_delete_per_layer(
@@ -490,17 +324,59 @@ class EbbinghausLLM:
         deletion_events = []
         
         for step in range(max_new_tokens):
-            # Forward pass
+            # 准备forward pass - 如果有memory weights，创建临时加权cache
+            if past_key_values is not None and isinstance(past_key_values, DynamicCache):
+                current_seq_len = past_key_values.get_seq_length()
+                if current_seq_len > 0:
+                    # 获取当前的记忆权重
+                    memory_weights = self.memory_manager.get_all_layer_weights(
+                        current_seq_len, self.device, self.model.dtype
+                    )
+                    # 创建临时的加权cache（不修改原始cache）
+                    weighted_cache = self._create_weighted_cache(past_key_values, memory_weights)
+                else:
+                    weighted_cache = past_key_values
+                    memory_weights = None
+            else:
+                weighted_cache = past_key_values
+                memory_weights = None
+            
+            # Forward pass with weighted cache
             outputs = self.model(
                 input_ids=current_ids,
-                past_key_values=past_key_values,
+                past_key_values=weighted_cache,  # 使用加权的cache
                 use_cache=True,
                 output_attentions=True,
                 return_dict=True
             )
             
-            # Update cache
-            past_key_values = outputs.past_key_values
+            # CRITICAL: 保存新的KV，但恢复原始cache的权重
+            # transformers会就地修改weighted_cache，我们需要提取新的KV并添加到原始cache
+            if past_key_values is not None and isinstance(past_key_values, DynamicCache):
+                # 获取新生成的KV（最后一个位置）
+                new_cache = outputs.past_key_values
+                if isinstance(new_cache, DynamicCache) and new_cache.get_seq_length() > past_key_values.get_seq_length():
+                    # 提取新的KV并添加到原始cache
+                    for layer_idx in range(min(len(past_key_values.key_cache), len(new_cache.key_cache))):
+                        if (new_cache.key_cache[layer_idx] is not None and 
+                            past_key_values.key_cache[layer_idx] is not None):
+                            # 获取新增的KV（最后一个token的KV）
+                            new_key = new_cache.key_cache[layer_idx][:, :, -1:, :]
+                            new_value = new_cache.value_cache[layer_idx][:, :, -1:, :]
+                            
+                            # 添加到原始cache
+                            past_key_values.key_cache[layer_idx] = torch.cat([
+                                past_key_values.key_cache[layer_idx], new_key
+                            ], dim=2)
+                            past_key_values.value_cache[layer_idx] = torch.cat([
+                                past_key_values.value_cache[layer_idx], new_value
+                            ], dim=2)
+                else:
+                    # 如果是第一次，直接使用新的cache
+                    past_key_values = outputs.past_key_values
+            else:
+                # 第一次生成，直接使用返回的cache
+                past_key_values = outputs.past_key_values
             
             # Update memory with attention weights
             if outputs.attentions is not None:
@@ -520,17 +396,12 @@ class EbbinghausLLM:
                         'layer_weights': attention_data
                     })
             
-            # Get current sequence length for memory weights
-            if past_key_values is not None:
+            # 对原始cache进行硬删除（如果之前计算了memory_weights）
+            if past_key_values is not None and memory_weights is not None:
                 current_seq_len = past_key_values.get_seq_length()
                 if current_seq_len > 0:
-                    # Get memory weights for each layer
-                    memory_weights = self.memory_manager.get_all_layer_weights(
-                        current_seq_len, self.device, self.model.dtype
-                    )
-                    
-                    # Apply memory weights and perform hard deletion
-                    self._apply_memory_to_past_kv_enhanced(past_key_values, memory_weights)
+                    # 注释掉权重应用，只进行硬删除
+                    # self._apply_memory_to_past_kv_enhanced(past_key_values, memory_weights)
                     
                     # Identify tokens to delete per layer
                     tokens_to_delete_per_layer = self._identify_tokens_to_delete_per_layer(
@@ -655,6 +526,46 @@ class EbbinghausLLM:
                 new_layer_memories[new_pos] = memory
         
         self.memory_manager.layer_memories[layer_idx] = new_layer_memories
+    
+    def _create_weighted_cache(self, past_key_values: Optional[DynamicCache], memory_weights: List[torch.Tensor]) -> Optional[DynamicCache]:
+        """创建应用了记忆权重的cache副本，不修改原始cache"""
+        if not isinstance(past_key_values, DynamicCache) or not memory_weights:
+            return past_key_values
+        
+        # 创建新的DynamicCache
+        weighted_cache = DynamicCache()
+        
+        for layer_idx in range(len(past_key_values.key_cache)):
+            if layer_idx < len(memory_weights) and layer_idx < len(past_key_values.key_cache):
+                weights = memory_weights[layer_idx]
+                key_cache = past_key_values.key_cache[layer_idx]
+                value_cache = past_key_values.value_cache[layer_idx]
+                
+                if key_cache is not None and value_cache is not None:
+                    # 确保权重维度匹配
+                    cache_len = key_cache.shape[2]
+                    if weights.shape[0] >= cache_len:
+                        weights = weights[:cache_len]
+                        # 应用权重但不修改原始tensor
+                        weights_expanded = weights.view(1, 1, -1, 1)
+                        weighted_cache.key_cache.append(key_cache * weights_expanded)
+                        weighted_cache.value_cache.append(value_cache * weights_expanded)
+                    else:
+                        # 权重长度不匹配，使用原始cache
+                        weighted_cache.key_cache.append(key_cache)
+                        weighted_cache.value_cache.append(value_cache)
+                else:
+                    weighted_cache.key_cache.append(None)
+                    weighted_cache.value_cache.append(None)
+            else:
+                # 超出权重范围，添加None
+                weighted_cache.key_cache.append(None)
+                weighted_cache.value_cache.append(None)
+        
+        # 复制其他属性
+        weighted_cache._seen_tokens = past_key_values._seen_tokens if hasattr(past_key_values, '_seen_tokens') else 0
+        
+        return weighted_cache
 
     def _common_generation_loop(
         self,
@@ -706,10 +617,10 @@ class EbbinghausLLM:
                 # Get memory weights for current cache length
                 cache_weights = self._get_memory_weights(actual_cache_len)
                 
-                # For memory_enhanced mode: apply memory weights directly
-                past_key_values = self._apply_memory_to_past_kv_enhanced(
-                    past_key_values, cache_weights
-                )
+                # 注释掉权重应用 - 使用临时权重机制
+                # past_key_values = self._apply_memory_to_past_kv_enhanced(
+                #     past_key_values, cache_weights
+                # )
                 
                 # Identify tokens to delete per layer based on memory weights
                 tokens_to_delete_per_layer = self._identify_tokens_to_delete_per_layer(
@@ -750,18 +661,10 @@ class EbbinghausLLM:
                         if different_layers:
                             print(f"  Layers with deletions: {', '.join(different_layers)}")
                     
-                    # 使用per-layer attention masks实现软删除（每层独立）
-                    if any(layer_deletions for layer_deletions in tokens_to_delete_per_layer):
-                        # 生成每层独立的attention masks
-                        per_layer_masks = self._generate_per_layer_attention_masks(
-                            actual_cache_len, tokens_to_delete_per_layer, self.device
-                        )
-                        
-                        # 存储masks以供forward使用
-                        if not hasattr(self, '_current_per_layer_masks'):
-                            self._current_per_layer_masks = per_layer_masks
-                        else:
-                            self._current_per_layer_masks = per_layer_masks
+                    # 注释掉per-layer masks逻辑 - 使用硬删除机制
+                    # if any(layer_deletions for layer_deletions in tokens_to_delete_per_layer):
+                    #     per_layer_masks = self._generate_per_layer_attention_masks(...)
+                    #     self._current_per_layer_masks = per_layer_masks
             
             # Forward propagation
             forward_kwargs = {
@@ -787,18 +690,9 @@ class EbbinghausLLM:
                     print(f"  DEBUG: Cache lengths before forward: {cache_lengths[:5]}{'...' if len(cache_lengths) > 5 else ''}")
                     print(f"  DEBUG: Unique lengths: {unique_lengths}")
             
-            # 对于memory_enhanced模式，使用per-layer masks来实现软删除
-            if generation_mode == "memory_enhanced" and hasattr(self, '_current_per_layer_masks'):
-                outputs = self._forward_with_per_layer_masks(
-                    input_ids=current_ids,
-                    past_key_values=past_key_values,
-                    per_layer_masks=self._current_per_layer_masks,
-                    output_attentions=generation_mode != "baseline"
-                )
-            else:
-                # baseline模式或没有masks时使用标准forward
-                forward_kwargs["past_key_values"] = past_key_values
-                outputs = self.model(**forward_kwargs)
+            # 使用标准forward（已移除per-layer masks逻辑）
+            forward_kwargs["past_key_values"] = past_key_values
+            outputs = self.model(**forward_kwargs)
             
             # Update past_key_values
             past_key_values = outputs.past_key_values

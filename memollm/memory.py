@@ -7,7 +7,7 @@ from dataclasses import dataclass
 @dataclass
 class LayerTokenMemory:
     """Memory information for each token in each layer"""
-    strength: float = 5.0  # Memory strength (S) - enhanced default value
+    strength: float = 1.0  # Memory strength (S) - enhanced default value
     time_steps: int = 0    # Time steps since last access (t)
     
     def get_retention_weight(self) -> float:
@@ -30,7 +30,7 @@ class LayerTokenMemory:
     
     def step_time(self) -> None:
         """Time step progression"""
-        self.time_steps += 0.1  # Increase time step to make forgetting faster for demonstration
+        self.time_steps += 0.01  # Increase time step to make forgetting faster for demonstration
 
 
 class EbbinghausMemoryManager:
