@@ -1,27 +1,78 @@
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache
 import time
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Tuple, Any
 import warnings
 
 from .memory import EbbinghausMemoryManager
+from .model import VariableLengthCache, VariableLengthModel
 
 warnings.filterwarnings('ignore')
 
 
+class TokenSampler:
+    """Token sampling utility class"""
+    
+    @staticmethod
+    def sample_next_token(
+        logits: torch.Tensor, 
+        temperature: float = 1.0,
+        do_sample: bool = True,
+        top_k: int = 0,
+        top_p: float = 1.0
+    ) -> int:
+        """Sample next token with temperature, top-k and top-p sampling"""
+        if not do_sample:
+            return torch.argmax(logits).item()
+        
+        # Modify logits in-place to avoid copying
+        if temperature != 1.0:
+            logits.div_(temperature)
+        
+        # If there is top_k, filter first
+        if top_k > 0 and top_k < logits.size(-1):
+            top_k_values, top_k_indices = torch.topk(logits, top_k)
+            # Create new smaller logits tensor
+            logits = top_k_values
+            probs = F.softmax(logits, dim=-1)
+            sampled_idx = torch.multinomial(probs, num_samples=1).item()
+            return top_k_indices[sampled_idx].item()
+        
+        probs = F.softmax(logits, dim=-1)
+        
+        # Top-p sampling (optimized version)
+        if top_p < 1.0:
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=0)
+            
+            # Find the cutoff point
+            cutoff_idx = (cumulative_probs <= top_p).sum().item()
+            if cutoff_idx < sorted_probs.size(0):
+                # Truncate and renormalize
+                selected_probs = sorted_probs[:cutoff_idx + 1]
+                selected_indices = sorted_indices[:cutoff_idx + 1]
+                selected_probs = selected_probs / selected_probs.sum()
+                
+                sampled_idx = torch.multinomial(selected_probs, num_samples=1).item()
+                return selected_indices[sampled_idx].item()
+        
+        return torch.multinomial(probs, num_samples=1).item()
+
+
 class EbbinghausLLM:
-    """艾宾浩斯记忆增强的LLM"""
+    """Ebbinghaus memory-enhanced LLM"""
 
-    def __init__(self, model_name="Qwen/Qwen2.5-0.5B-Instruct", device=None):
-        print(f"初始化模型: {model_name}")
+    def __init__(self, model_name: str = "Qwen/Qwen2.5-0.5B-Instruct", device: Optional[str] = None) -> None:
+        print(f"Initializing model: {model_name}")
 
-        # 加载分词器
+        # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # 加载模型
+        # Load model
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float16,
@@ -30,23 +81,23 @@ class EbbinghausLLM:
             attn_implementation="eager"
         )
 
-        # 获取设备和模型信息
+        # Get device and model info
         self.device = next(self.model.parameters()).device
         self.num_layers = len(self.model.model.layers) if hasattr(self.model, 'model') else 12
-        print(f"模型加载到设备: {self.device}, 层数: {self.num_layers}")
+        print(f"Model loaded on device: {self.device}, layers: {self.num_layers}")
 
-        # 初始化记忆管理器
+        # Initialize memory manager
         self.memory_manager = EbbinghausMemoryManager(self.num_layers)
         
-        # 性能优化缓存
+        # Performance optimization cache
         self._cached_memory_weights = None
         self._cached_seq_len = 0
         self._last_update_step = -1
         self._cached_attention_mask = None
         self._cached_mask_seq_len = 0
 
-    def prepare_input(self, text: str) -> Dict:
-        """准备模型输入"""
+    def prepare_input(self, text: str) -> Dict[str, Any]:
+        """Prepare model input"""
         if "Qwen" in self.model.__class__.__name__:
             messages = [{"role": "user", "content": text}]
             formatted_text = self.tokenizer.apply_chat_template(
@@ -59,9 +110,9 @@ class EbbinghausLLM:
 
     
 
-    def get_detailed_token_weights(self, token_ids: torch.Tensor) -> Dict:
-        """获取每个token的详细权重信息"""
-        # 避免多次device转换，一次性转换到CPU用于tokenizer
+    def get_token_weight_details(self, token_ids: torch.Tensor) -> Dict[str, Any]:
+        """Get detailed weight information for each token"""
+        # Avoid multiple device conversions, convert to CPU at once for tokenizer
         token_ids_list = token_ids.tolist() if not token_ids.is_cuda else token_ids.cpu().tolist()
         tokens = self.tokenizer.convert_ids_to_tokens(token_ids_list)
         token_texts = [self.tokenizer.decode([tid]) for tid in token_ids_list]
@@ -74,7 +125,7 @@ class EbbinghausLLM:
             'layers_info': {}
         }
         
-        # 为每一层获取权重信息
+        # Get weight information for each layer
         for layer_idx in range(self.num_layers):
             layer_info = {
                 'retention_weights': [],
@@ -84,14 +135,14 @@ class EbbinghausLLM:
             }
             
             for pos in range(seq_len):
-                if pos in self.memory_manager.memories[layer_idx]:
-                    memory = self.memory_manager.memories[layer_idx][pos]
+                if pos in self.memory_manager.layer_memories[layer_idx]:
+                    memory = self.memory_manager.layer_memories[layer_idx][pos]
                     retention = memory.get_retention_weight()
                     
                     layer_info['retention_weights'].append(round(retention, 4))
-                    layer_info['memory_strength'].append(round(memory.S, 4))
-                    layer_info['time_steps'].append(memory.t)
-                    layer_info['memory_formula'].append(f"e^(-{memory.t}/{memory.S:.2f}) = {retention:.4f}")
+                    layer_info['memory_strength'].append(round(memory.strength, 4))
+                    layer_info['time_steps'].append(memory.time_steps)
+                    layer_info['memory_formula'].append(f"e^(-{memory.time_steps}/{memory.strength:.2f}) = {retention:.4f}")
                 else:
                     layer_info['retention_weights'].append(1.0)
                     layer_info['memory_strength'].append(1.0)
@@ -102,25 +153,25 @@ class EbbinghausLLM:
         
         return detailed_info
 
-    def print_token_weights_summary(self, token_weights_info: Dict, show_layers: Optional[List[int]] = None):
-        """打印token权重摘要"""
+    def print_token_weight_summary(self, token_weights_info: Dict[str, Any], show_layers: Optional[List[int]] = None) -> None:
+        """Print token weight summary"""
         if show_layers is None:
             show_layers = [0, -1]
             
         print(f"\n{'='*80}")
-        print("TOKEN权重详细信息")
+        print("TOKEN WEIGHT DETAILS")
         print(f"{'='*80}")
         
         tokens = token_weights_info['tokens']
         token_texts = token_weights_info['token_texts']
         
-        # 显示token基本信息
-        print(f"序列长度: {len(tokens)}")
-        print(f"Token列表: {' | '.join([f'{i}:{t}' for i, t in enumerate(tokens[:20])])}")
+        # Display basic token information
+        print(f"Sequence length: {len(tokens)}")
+        print(f"Token list: {' | '.join([f'{i}:{t}' for i, t in enumerate(tokens[:20])])}")
         if len(tokens) > 20:
-            print("... (显示前20个)")
+            print("... (showing first 20)")
         
-        # 显示指定层的权重信息
+        # Display weight information for specified layers
         layers_to_show = []
         for layer_idx in show_layers:
             if layer_idx == -1:
@@ -133,21 +184,22 @@ class EbbinghausLLM:
             layer_info = token_weights_info['layers_info'][layer_key]
             
             print(f"\n--- {layer_key.upper()} ---")
-            print(f"{'位置':<4} {'Token':<15} {'强度(S)':<8} {'时间(t)':<7} {'权重(R)':<8} {'公式'}")
+            print(f"{'Pos':<4} {'Token':<15} {'Strength(S)':<8} {'Time(t)':<7} {'Weight(R)':<8} {'Formula'}")
             print("-" * 80)
             
-            for i in range(min(20, len(tokens))):  # 只显示前20个
+            for i in range(min(20, len(tokens))):  # Only show first 20
                 token_display = token_texts[i][:12] if len(token_texts[i]) > 12 else token_texts[i]
                 print(f"{i:<4} {token_display:<15} {layer_info['memory_strength'][i]:<8} "
                       f"{layer_info['time_steps'][i]:<7} {layer_info['retention_weights'][i]:<8} "
                       f"{layer_info['memory_formula'][i]}")
             
             if len(tokens) > 20:
-                print("... (显示前20个)")
+                print("... (showing first 20)")
         
         print(f"{'='*80}")
 
 
+    
     def _sample_next_token(
         self, 
         logits: torch.Tensor, 
@@ -156,482 +208,753 @@ class EbbinghausLLM:
         top_k: int = 0,
         top_p: float = 1.0
     ) -> int:
-        """采样下一个token"""
-        # 应用温度
-        if temperature != 1.0:
-            logits = logits / temperature
-            
-        # 计算概率
-        probs = F.softmax(logits, dim=-1)
-        
-        if not do_sample:
-            # 贪心采样
-            return torch.argmax(probs).item()
-        
-        # Top-k 采样
-        if top_k > 0:
-            top_k_probs, top_k_indices = torch.topk(probs, min(top_k, probs.size(-1)))
-            probs = torch.zeros_like(probs)
-            probs.scatter_(0, top_k_indices, top_k_probs)
-            probs = probs / probs.sum()
-        
-        # Top-p (nucleus) 采样
-        if top_p < 1.0:
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=0)
-            
-            # 去掉累积概率超过top_p的token
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
-            sorted_indices_to_remove[0] = False
-            
-            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-            probs[indices_to_remove] = 0
-            probs = probs / probs.sum()
-        
-        # 多项式采样
-        return torch.multinomial(probs, num_samples=1).item()
+        """Sample next token using TokenSampler"""
+        return TokenSampler.sample_next_token(logits, temperature, do_sample, top_k, top_p)
     
-    def _sample_next_token_fast(
-        self, 
-        logits: torch.Tensor, 
-        temperature: float = 1.0,
-        do_sample: bool = True,
-        top_k: int = 0,
-        top_p: float = 1.0
-    ) -> int:
-        """优化的采样方法"""
-        if not do_sample:
-            return torch.argmax(logits).item()
-        
-        # 原地修改logits避免复制
-        if temperature != 1.0:
-            logits.div_(temperature)
-        
-        # 如果有top_k，先过滤
-        if top_k > 0 and top_k < logits.size(-1):
-            top_k_values, top_k_indices = torch.topk(logits, top_k)
-            # 创建新的较小logits tensor
-            logits = top_k_values
-            probs = F.softmax(logits, dim=-1)
-            sampled_idx = torch.multinomial(probs, num_samples=1).item()
-            return top_k_indices[sampled_idx].item()
-        
-        probs = F.softmax(logits, dim=-1)
-        
-        # Top-p采样（优化版）
-        if top_p < 1.0:
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=0)
-            
-            # 找到截断点
-            cutoff_idx = (cumulative_probs <= top_p).sum().item()
-            if cutoff_idx < sorted_probs.size(0):
-                # 截断并重新归一化
-                selected_probs = sorted_probs[:cutoff_idx + 1]
-                selected_indices = sorted_indices[:cutoff_idx + 1]
-                selected_probs = selected_probs / selected_probs.sum()
-                
-                sampled_idx = torch.multinomial(selected_probs, num_samples=1).item()
-                return selected_indices[sampled_idx].item()
-        
-        return torch.multinomial(probs, num_samples=1).item()
-    
-    def _get_memory_weights_fast(self, seq_len: int):
-        """快速获取记忆权重（带缓存）"""
-        # 只有序列长度改变时才重新计算
+    def _get_memory_weights(self, seq_len: int) -> List[torch.Tensor]:
+        """Get memory weights with caching"""
+        # Only recalculate when sequence length changes
         if seq_len != self._cached_seq_len or self._cached_memory_weights is None:
-            self._cached_memory_weights = self.memory_manager.get_all_layer_weights_batch(
+            self._cached_memory_weights = self.memory_manager.get_all_layer_weights(
                 seq_len, self.device, self.model.dtype
             )
             self._cached_seq_len = seq_len
         
         return self._cached_memory_weights
     
-    def _apply_memory_to_past_kv_fast(self, past_key_values, memory_weights):
-        """快速应用记忆权重到past_key_values（原地修改）"""
+    
+    def _apply_memory_to_past_kv_enhanced(
+        self, past_key_values: Optional[Union[Tuple, DynamicCache]], memory_weights: List[torch.Tensor]
+    ) -> Optional[Union[Tuple, DynamicCache]]:
+        """Apply memory weights without threshold clamping (enhanced version)"""
         if past_key_values is None or not memory_weights:
             return past_key_values
         
-        # 批量处理，只对前一半层
-        max_layers = min(len(past_key_values), len(memory_weights), self.num_layers // 2)
-        
-        for layer_idx in range(max_layers):
-            weights = memory_weights[layer_idx]
-            key_cache, value_cache = past_key_values[layer_idx]
+        # Handle DynamicCache objects
+        if isinstance(past_key_values, DynamicCache):
+            # Apply weights to DynamicCache
+            max_layers = min(len(past_key_values.key_cache), len(memory_weights))
             
-            if weights.shape[0] == key_cache.shape[2]:
-                # 原地修改，避免新tensor创建
-                adjusted_weights = torch.clamp(weights, min=0.8, max=1.0)
-                weights_expanded = adjusted_weights.view(1, 1, -1, 1)
+            for layer_idx in range(max_layers):
+                weights = memory_weights[layer_idx]
+                key_cache = past_key_values.key_cache[layer_idx]
+                value_cache = past_key_values.value_cache[layer_idx]
                 
-                # 原地修改key cache
-                key_cache.mul_(weights_expanded)
+                if key_cache is not None and weights.shape[0] == key_cache.shape[2]:
+                    # Apply weights directly without clamping
+                    weights_expanded = weights.view(1, 1, -1, 1)
+                    
+                    # Apply to both key and value cache
+                    key_cache.mul_(weights_expanded)
+                    value_cache.mul_(weights_expanded)
+        else:
+            # Handle tuple format
+            max_layers = min(len(past_key_values), len(memory_weights))
+            
+            for layer_idx in range(max_layers):
+                weights = memory_weights[layer_idx]
+                layer_cache = past_key_values[layer_idx]
+                
+                # 检查layer_cache是否是tuple
+                if isinstance(layer_cache, tuple) and len(layer_cache) == 2:
+                    key_cache, value_cache = layer_cache
+                    
+                    if key_cache is not None and hasattr(key_cache, 'shape') and weights.shape[0] == key_cache.shape[2]:
+                        # Apply weights directly without clamping
+                        weights_expanded = weights.view(1, 1, -1, 1)
+                        
+                        # Apply to both key and value cache
+                        key_cache.mul_(weights_expanded)
+                        if value_cache is not None:
+                            value_cache.mul_(weights_expanded)
+                else:
+                    # 可能是其他格式，跳过
+                    continue
         
         return past_key_values
     
-    def _generate_dynamic_attention_mask_fast(self, current_seq_len: int, memory_weights: List[torch.Tensor]):
-        """快速生成attention mask（向量化操作）"""
-        if not memory_weights:
-            return None
+    def _generate_per_layer_attention_masks(self, current_seq_len: int, tokens_to_delete_per_layer: List[List[int]], device: torch.device) -> List[torch.Tensor]:
+        """Generate per-layer attention masks to soft-mask deleted tokens instead of hard deletion"""
+        if not tokens_to_delete_per_layer:
+            return []
         
-        # 尝试使用缓存的mask（扩展到当前长度）
-        if self._cached_attention_mask is not None and self._cached_mask_seq_len < current_seq_len:
-            # 扩展旧mask并计算新部分
-            old_len = self._cached_mask_seq_len
-            new_mask = self._compute_mask_for_range(memory_weights, old_len, current_seq_len)
-            if new_mask is not None:
-                # 拼接旧mask和新计算的部分
-                self._cached_attention_mask = torch.cat([self._cached_attention_mask[:, :old_len], new_mask], dim=1)
-                self._cached_mask_seq_len = current_seq_len
-                return self._cached_attention_mask
+        per_layer_masks = []
         
-        # 重新计算整个mask
-        threshold = 0.001
-        min_layers = len(memory_weights) // 2  # 整数除法更快
-        
-        # 快速筛选有效权重
-        valid_weights = []
-        for w in memory_weights:
-            if w.shape[0] >= current_seq_len:
-                valid_weights.append(w[:current_seq_len])
-        
-        if valid_weights:
-            # 使用torch.stack一次性处理所有层
-            stacked_weights = torch.stack(valid_weights)  # [num_layers, seq_len]
-            
-            # 使用tensor操作计算，保持设备一致性
-            low_weight_mask = (stacked_weights < threshold).sum(dim=0)  # [seq_len]
-            
-            # 直接生成float mask，避免多次类型转换
-            attention_mask = (low_weight_mask < min_layers).float().unsqueeze(0)
-            
-            # 缓存结果
-            self._cached_attention_mask = attention_mask
-            self._cached_mask_seq_len = current_seq_len
-            
-            return attention_mask
-        
-        return None
-    
-    def _compute_mask_for_range(self, memory_weights: List[torch.Tensor], start: int, end: int):
-        """计算指定范围的mask"""
-        threshold = 0.001
-        min_layers = len(memory_weights) // 2
-        
-        valid_weights = []
-        for w in memory_weights:
-            if w.shape[0] >= end:
-                valid_weights.append(w[start:end])
-        
-        if valid_weights:
-            stacked_weights = torch.stack(valid_weights)
-            low_weight_mask = (stacked_weights < threshold).sum(dim=0)
-            new_mask = (low_weight_mask < min_layers).float().unsqueeze(0)
-            return new_mask
-        
-        return None
-    
-    def _apply_memory_to_past_kv(self, past_key_values, memory_weights):
-        """将记忆权重应用到past_key_values"""
-        if past_key_values is None or not memory_weights:
-            return past_key_values
-            
-        # 修改past_key_values
-        for layer_idx in range(min(len(past_key_values), len(memory_weights))):
-            if layer_idx >= self.num_layers // 2:  # 只对前一半层应用
-                break
+        for layer_idx, tokens_to_delete in enumerate(tokens_to_delete_per_layer):
+            if layer_idx < self.num_layers:
+                # Create attention mask for this layer: 1 for attend, 0 for mask
+                layer_mask = torch.ones(current_seq_len, dtype=torch.bool, device=device)
                 
-            weights = memory_weights[layer_idx]
-            key_cache, value_cache = past_key_values[layer_idx]
-            
-            if weights.shape[0] == key_cache.shape[2]:  # 检查维度匹配
-                # Soft delete: 权重范围[0.8, 1.0]
-                adjusted_weights = torch.clamp(weights, min=0.8, max=1.0)
-                weights_expanded = adjusted_weights.view(1, 1, -1, 1)
+                # Mask the tokens this layer wants to delete
+                for pos in tokens_to_delete:
+                    if 0 <= pos < current_seq_len:
+                        layer_mask[pos] = False
                 
-                # 修改key cache
-                new_key = key_cache * weights_expanded
-                past_key_values[layer_idx] = (new_key, value_cache)
+                # Convert to additive attention mask format (0 for attend, -inf for mask)
+                # Shape: [1, 1, 1, seq_len] for broadcasting to [batch, heads, seq_len, seq_len]
+                additive_mask = torch.where(
+                    layer_mask, 
+                    0.0, 
+                    float('-inf')
+                ).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+                
+                per_layer_masks.append(additive_mask)
+                
+                if layer_idx < 3:  # Debug info for first few layers
+                    deleted_count = len(tokens_to_delete)
+                    print(f"  DEBUG: Layer {layer_idx} mask: {deleted_count} tokens masked")
+            else:
+                # For layers beyond what we have deletion info, create empty mask (attend to all)
+                empty_mask = torch.zeros(1, 1, 1, current_seq_len, device=device)
+                per_layer_masks.append(empty_mask)
         
-        return past_key_values
+        return per_layer_masks
     
-    def _generate_dynamic_attention_mask(self, current_seq_len: int, memory_weights: List[torch.Tensor]):
-        """动态生成attention mask"""
-        if not memory_weights:
-            return None
+    def _adjust_memory_per_layer(self, tokens_to_delete_per_layer: List[List[int]]) -> None:
+        """Adjust memory manager after layer-specific token deletion"""
+        if not tokens_to_delete_per_layer:
+            return
+        
+        # Update each layer independently
+        for layer_idx in range(self.num_layers):
+            if layer_idx >= len(tokens_to_delete_per_layer) or not tokens_to_delete_per_layer[layer_idx]:
+                continue
+                
+            layer_memories = self.memory_manager.layer_memories[layer_idx]
+            deleted_positions = sorted(set(tokens_to_delete_per_layer[layer_idx]))
             
-        # 计算需要多少层同时满足条件才mask
-        min_layers = int(len(memory_weights) * 0.5)  # 50%的层
-        threshold = 0.001
+            # Create new memory dictionary with adjusted positions
+            new_layer_memories = {}
+            
+            for old_pos, memory in list(layer_memories.items()):
+                # Count how many positions before this one were deleted
+                positions_deleted_before = sum(1 for dp in deleted_positions if dp < old_pos)
+                
+                # Calculate new position
+                new_pos = old_pos - positions_deleted_before
+                
+                # Only keep if the position itself wasn't deleted
+                if old_pos not in deleted_positions and new_pos >= 0:
+                    new_layer_memories[new_pos] = memory
+            
+            self.memory_manager.layer_memories[layer_idx] = new_layer_memories
+    
+    def _delete_tokens_from_sequence(self, token_ids: torch.Tensor, tokens_to_delete: List[int]) -> torch.Tensor:
+        """Delete tokens from input sequence"""
+        if not tokens_to_delete or token_ids.shape[1] == 0:
+            return token_ids
         
-        # 统计每个位置在多少层中权重低于阈值
-        low_weight_counts = torch.zeros(current_seq_len, device=self.device)
+        # Sort positions to delete
+        positions_to_delete = sorted(set(tokens_to_delete), reverse=True)
         
-        for layer_weights in memory_weights:
-            if layer_weights.shape[0] >= current_seq_len:
-                low_weight_mask = layer_weights[:current_seq_len] < threshold
-                low_weight_counts += low_weight_mask.float()
+        # Create a mask for positions to keep
+        seq_len = token_ids.shape[1]
+        keep_mask = torch.ones(seq_len, dtype=torch.bool, device=token_ids.device)
         
-        # 当超过min_layers个层的权重都低于阈值时，才真正mask掉
-        sparse_mask = low_weight_counts >= min_layers
+        for pos in positions_to_delete:
+            if 0 <= pos < seq_len:
+                keep_mask[pos] = False
         
-        # 创建attention mask (1表示保留，0表示mask)
-        attention_mask = (~sparse_mask).float().unsqueeze(0)  # [1, seq_len]
+        # Return only the positions we want to keep
+        return token_ids[:, keep_mask]
+    
+    def _forward_with_per_layer_masks(self, input_ids, past_key_values=None, per_layer_masks=None, output_attentions=False):
+        """Custom forward method with per-layer attention masks for soft deletion"""
         
-        return attention_mask
-
-    def _remove_low_weight_tokens(self, past_key_values, memory_weights, full_input_ids, threshold=0.01):
-        """直接删除低权重token而不是使用mask"""
-        if past_key_values is None or not memory_weights:
-            return past_key_values, full_input_ids, []
+        # 使用标准的模型forward，但修改attention mask
+        # 这比重新实现整个forward简单得多
         
-        seq_len = full_input_ids.shape[1]
+        # 我们将通过monkey patching每层的attention来实现per-layer mask
+        original_forwards = []
         
-        # 获取所有层的平均权重来决定删除哪些token
-        avg_weights = torch.zeros(seq_len, device=self.device)
-        valid_layer_count = 0
-        
-        for layer_weights in memory_weights:
-            if layer_weights.shape[0] >= seq_len:
-                avg_weights += layer_weights[:seq_len]
-                valid_layer_count += 1
-        
-        if valid_layer_count > 0:
-            avg_weights = avg_weights / valid_layer_count
-        
-        # 找到需要保留的token位置
-        keep_mask = avg_weights >= threshold
-        keep_indices = torch.where(keep_mask)[0]
-        removed_indices = torch.where(~keep_mask)[0].tolist()
-        
-        if len(keep_indices) == seq_len:
-            # 没有token需要删除
-            return past_key_values, full_input_ids, []
-        
-        if len(keep_indices) == 0:
-            # 不能删除所有token，保留最后一个
-            keep_indices = torch.tensor([seq_len - 1], device=self.device)
-            removed_indices = list(range(seq_len - 1))
-        
-        # 确保 keep_indices 是有序的，避免索引错误
-        keep_indices, _ = torch.sort(keep_indices)
-        
-        # 限制删除的token数量，避免删除太多导致问题
-        max_remove = int(seq_len * 0.5)  # 最多删除50%的token
-        if len(removed_indices) > max_remove:
-            # 只删除权重最低的部分token
-            weights_to_remove = avg_weights[~keep_mask]
-            _, lowest_indices = torch.topk(weights_to_remove, max_remove, largest=False)
-            actual_remove_indices = torch.tensor(removed_indices, device=self.device)[lowest_indices]
-            keep_mask = torch.ones(seq_len, dtype=torch.bool, device=self.device)
-            keep_mask[actual_remove_indices] = False
-            keep_indices = torch.where(keep_mask)[0]
-            keep_indices, _ = torch.sort(keep_indices)
-            removed_indices = actual_remove_indices.tolist()
-        
-        # 更新input_ids
-        new_input_ids = full_input_ids[:, keep_indices]
-        
-        # 安全地更新past_key_values
-        new_past_key_values = []
         try:
-            for layer_idx, (key_cache, value_cache) in enumerate(past_key_values):
-                # 检查维度
-                if key_cache.shape[2] != seq_len or value_cache.shape[2] != seq_len:
-                    # 维度不匹配，跳过删除
-                    return past_key_values, full_input_ids, []
-                
-                # key_cache和value_cache的形状通常是[batch_size, num_heads, seq_len, head_dim]
-                new_key = key_cache[:, :, keep_indices, :]
-                new_value = value_cache[:, :, keep_indices, :]
-                new_past_key_values.append((new_key, new_value))
-        except Exception as e:
-            # 如果出现错误，返回原始值
-            print(f"删除token时出错: {e}")
-            return past_key_values, full_input_ids, []
-        
-        # 确保返回正确的格式
-        new_past_key_values = tuple(new_past_key_values)
-        
-        return new_past_key_values, new_input_ids, removed_indices
-    
-    @torch.no_grad()
-    def generate_sparse_delete(
-        self,
-        input_text: str,
-        max_new_tokens: int = 100,
-        temperature: float = 0.7,
-        do_sample: bool = True,
-        top_k: int = 0,
-        top_p: float = 0.9,
-        return_attention_weights: bool = False,
-        verbose: bool = True,
-        force_exact_length: bool = False,
-        deletion_threshold: float = 0.01,
-        deletion_interval: int = 5,  # 每隔多少步删除一次
-    ):
-        """新的稀疏实现：直接删除低权重token而不是mask"""
-        # 准备输入
-        inputs = self.prepare_input(input_text)
-        input_ids = inputs["input_ids"]
-        
-        # 初始化记忆管理器
-        self.memory_manager = EbbinghausMemoryManager(self.num_layers)
-        
-        start_time = time.time()
-        if verbose:
-            print(f"开始稀疏删除生成，输入长度: {input_ids.shape[1]}")
-        
-        generated_ids = []
-        full_input_ids = input_ids.clone()  # 保持完整的input_ids历史
-        past_key_values = None
-        attention_weights_history = [] if return_attention_weights else None
-        total_removed = 0
-        
-        for step in range(max_new_tokens):
-            current_seq_len = full_input_ids.shape[1]
+            # 保存原始的layer forward方法并替换为自定义版本
+            for layer_idx, layer in enumerate(self.model.model.layers):
+                if layer_idx < len(per_layer_masks):
+                    layer_mask = per_layer_masks[layer_idx]
+                    
+                    # 保存原始方法
+                    original_forward = layer.forward
+                    original_forwards.append(original_forward)
+                    
+                    # 创建带有特定mask的wrapper
+                    def create_masked_forward(original_func, mask):
+                        def masked_forward(hidden_states, attention_mask=None, **kwargs):
+                            # 如果有layer-specific mask，将其与现有mask结合
+                            if mask is not None and mask.shape[-1] > 0:
+                                if attention_mask is not None:
+                                    # 结合现有mask和layer-specific mask
+                                    combined_mask = attention_mask + mask.expand_as(attention_mask)
+                                else:
+                                    # 使用layer-specific mask
+                                    batch_size = hidden_states.shape[0]
+                                    seq_len = hidden_states.shape[1]
+                                    combined_mask = mask.expand(batch_size, 1, seq_len, -1)
+                                
+                                kwargs['attention_mask'] = combined_mask
+                            
+                            return original_func(hidden_states, attention_mask=attention_mask, **kwargs)
+                        return masked_forward
+                    
+                    # 替换layer的forward方法
+                    layer.forward = create_masked_forward(original_forward, layer_mask)
+                else:
+                    original_forwards.append(layer.forward)
             
-            # 获取记忆权重
-            memory_weights = self.memory_manager.get_all_layer_weights_batch(
-                current_seq_len, self.device, self.model.dtype
+            # 现在调用标准的model forward
+            outputs = self.model(
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=True,
+                return_dict=True
             )
             
-            # 删除低权重token（按间隔进行）
-            if step > 0 and step % deletion_interval == 0:  # 按指定间隔删除
-                old_past_kv, full_input_ids, removed_indices = self._remove_low_weight_tokens(
-                    past_key_values, memory_weights, full_input_ids, deletion_threshold
-                )
-                
-                if removed_indices:
-                    total_removed += len(removed_indices)
-                    if verbose and step < 5:
-                        print(f"Step {step}: 删除了 {len(removed_indices)} 个token, 剩余 {full_input_ids.shape[1]} 个token")
-                    
-                    # 如果删除了token，重置past_key_values以避免格式问题
-                    past_key_values = None
-                    
-                    # 批量更新记忆管理器（优化版）
-                    removed_set = set(removed_indices)  # 使用集合加速查找
-                    for layer_idx in range(self.num_layers):
-                        layer_memories = self.memory_manager.memories[layer_idx]
-                        if not layer_memories:
-                            continue
-                        
-                        # 一次性构建新的记忆映射
-                        new_memories = {}
-                        offset_map = {}  # 缓存偏移量计算
-                        offset = 0
-                        
-                        for pos in range(full_input_ids.shape[1] + len(removed_indices)):
-                            if pos in removed_set:
-                                offset += 1
-                            else:
-                                offset_map[pos] = pos - offset
-                        
-                        # 批量重映射
-                        for old_pos, memory in layer_memories.items():
-                            if old_pos not in removed_set and old_pos in offset_map:
-                                new_memories[offset_map[old_pos]] = memory
-                        
-                        self.memory_manager.memories[layer_idx] = new_memories
+            return outputs
             
-            # 前向传播
-            if step == 0 or past_key_values is None:
-                # 第一步或删除token后需要传入完整序列
-                current_ids = full_input_ids
+        finally:
+            # 恢复原始的forward方法
+            for layer_idx, layer in enumerate(self.model.model.layers):
+                if layer_idx < len(original_forwards):
+                    layer.forward = original_forwards[layer_idx]
+    
+    
+    def _identify_tokens_to_delete_per_layer(
+        self, current_seq_len: int, memory_weights: List[torch.Tensor], threshold: float
+    ) -> List[List[int]]:
+        """Identify tokens to delete independently for each layer"""
+        if not memory_weights:
+            return []
+        
+        tokens_to_delete_per_layer = []
+        
+        # Process each layer independently
+        for layer_idx, weights in enumerate(memory_weights):
+            if weights.shape[0] >= current_seq_len:
+                layer_weights = weights[:current_seq_len]
+                # Find positions where weight is below threshold for this layer
+                low_weight_positions = (layer_weights < threshold).nonzero(as_tuple=True)[0].tolist()
+                tokens_to_delete_per_layer.append(low_weight_positions)
             else:
-                # 只传入最新生成的token
-                current_ids = torch.tensor([[generated_ids[-1]]], device=self.device, dtype=torch.long)
+                tokens_to_delete_per_layer.append([])
+        
+        return tokens_to_delete_per_layer
+    
+    def _update_memory_positions_after_deletion(self, tokens_to_delete: List[int], original_seq_len: int) -> None:
+        """Update memory manager positions after token deletion"""
+        if not tokens_to_delete:
+            return
+        
+        # Create position mapping
+        deleted_positions = set(tokens_to_delete)
+        position_mapping = {}
+        new_idx = 0
+        for old_idx in range(original_seq_len):
+            if old_idx not in deleted_positions:
+                position_mapping[old_idx] = new_idx
+                new_idx += 1
+        
+        # Update memory positions for all layers
+        for layer_idx in range(self.num_layers):
+            layer_memories = self.memory_manager.layer_memories[layer_idx]
+            new_layer_memories = {}
             
+            for old_pos, memory in layer_memories.items():
+                if old_pos in position_mapping:
+                    new_pos = position_mapping[old_pos]
+                    new_layer_memories[new_pos] = memory
+            
+            self.memory_manager.layer_memories[layer_idx] = new_layer_memories
+    
+    def _hard_delete_generation_loop(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        force_exact_length: bool,
+        verbose: bool,
+        return_attention_weights: bool = False,
+        hard_delete_threshold: float = 0.01
+    ) -> Dict[str, Any]:
+        """Generation loop with true hard deletion using DynamicCache manipulation"""
+        generated_ids = []
+        current_ids = input_ids
+        past_key_values = None
+        attention_weights_history = [] if return_attention_weights else None
+        
+        # Track deletion statistics
+        total_cache_deletions = 0
+        deletion_events = []
+        
+        for step in range(max_new_tokens):
+            # Forward pass
             outputs = self.model(
                 input_ids=current_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
-                output_attentions=True,  # 必须为True以更新记忆
+                output_attentions=True,
                 return_dict=True
             )
             
-            # 更新past_key_values
+            # Update cache
             past_key_values = outputs.past_key_values
             
-            # 更新记忆
+            # Update memory with attention weights
             if outputs.attentions is not None:
                 layer_attentions = [
                     layer_attn[0, :, -1, :].mean(dim=0, keepdim=True) 
                     for layer_attn in outputs.attentions
                 ]
                 
-                # 更新所有层的记忆
-                self.memory_manager.update_all_layer_memories_batch(layer_attentions)
+                # Update memory for all layers
+                self.memory_manager.update_all_layer_memories(layer_attentions)
                 
-                # 记录注意力历史
-                if return_attention_weights and attention_weights_history is not None:
+                # Record attention history if needed
+                if return_attention_weights:
                     attention_data = [attn.squeeze().detach() for attn in layer_attentions]
                     attention_weights_history.append({
                         'step': step,
-                        'seq_len': full_input_ids.shape[1],
                         'layer_weights': attention_data
                     })
             
-            # 获取最后一个token的logits
-            logits = outputs.logits[0, -1, :]
+            # Get current sequence length for memory weights
+            if past_key_values is not None:
+                current_seq_len = past_key_values.get_seq_length()
+                if current_seq_len > 0:
+                    # Get memory weights for each layer
+                    memory_weights = self.memory_manager.get_all_layer_weights(
+                        current_seq_len, self.device, self.model.dtype
+                    )
+                    
+                    # Apply memory weights and perform hard deletion
+                    self._apply_memory_to_past_kv_enhanced(past_key_values, memory_weights)
+                    
+                    # Identify tokens to delete per layer
+                    tokens_to_delete_per_layer = self._identify_tokens_to_delete_per_layer(
+                        current_seq_len, memory_weights, hard_delete_threshold
+                    )
+                    
+                    # Perform hard deletion for each layer independently
+                    layer_deletions = 0
+                    for layer_idx, positions_to_delete in enumerate(tokens_to_delete_per_layer):
+                        if positions_to_delete and isinstance(past_key_values, DynamicCache):
+                            # Delete tokens from DynamicCache
+                            if layer_idx < len(past_key_values.key_cache):
+                                key_cache = past_key_values.key_cache[layer_idx]
+                                value_cache = past_key_values.value_cache[layer_idx]
+                                
+                                if key_cache is not None:
+                                    # Create mask for positions to keep
+                                    seq_len = key_cache.shape[-2]
+                                    keep_mask = torch.ones(seq_len, dtype=torch.bool, device=key_cache.device)
+                                    for pos in positions_to_delete:
+                                        if 0 <= pos < seq_len:
+                                            keep_mask[pos] = False
+                                    
+                                    # Apply mask to cache
+                                    past_key_values.key_cache[layer_idx] = key_cache[:, :, keep_mask, :]
+                                    past_key_values.value_cache[layer_idx] = value_cache[:, :, keep_mask, :]
+                                    
+                                    layer_deletions += len(positions_to_delete)
+                                    
+                                    # Update memory manager positions for this layer
+                                    self._adjust_memory_for_layer(layer_idx, positions_to_delete)
+                    
+                    if layer_deletions > 0:
+                        total_cache_deletions += layer_deletions
+                        deletion_events.append({
+                            'step': step,
+                            'per_layer_deletions': [len(layer) for layer in tokens_to_delete_per_layer],
+                            'total_deletions': layer_deletions
+                        })
+                        
+                        if verbose and step < 5:
+                            layer_stats = [len(layer) for layer in tokens_to_delete_per_layer]
+                            print(f"Step {step}: Hard deleted tokens per layer: {layer_stats[:5]}{'...' if len(layer_stats) > 5 else ''}")
             
-            # 采样下一个token
-            next_token_id = self._sample_next_token_fast(
+            # Get logits and sample next token
+            logits = outputs.logits[0, -1, :]
+            next_token_id = self._sample_next_token(
                 logits, temperature, do_sample, top_k, top_p
             )
             
             generated_ids.append(next_token_id)
             
-            # 检查是否结束
+            # Check if finished
             if next_token_id == self.tokenizer.eos_token_id and not force_exact_length:
                 if verbose:
-                    print(f"遇到EOS token，提前结束")
+                    print(f"Encountered EOS token, ending early")
                 break
             
-            # 将新token添加到完整序列中
-            new_token_tensor = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
-            full_input_ids = torch.cat([full_input_ids, new_token_tensor], dim=1)
+            # Update input for next iteration
+            current_ids = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
             
-            # 时间步进
+            # Time step progression
             self.memory_manager.step_all_memories()
             
+            # Clear memory weight cache
+            self._cached_memory_weights = None
+            
             if verbose and (step + 1) % 10 == 0:
-                print(f"已生成 {step + 1} tokens, 删除了 {total_removed} 个token")
+                print(f"Generated {step + 1} tokens")
         
-        generation_time = time.time() - start_time
+        # Calculate final statistics
+        final_seq_len = input_ids.shape[1] + len(generated_ids)
+        layer_cache_lengths = []
         
-        # 构建完整序列用于解码
-        original_input_len = input_ids.shape[1]
-        decode_ids = torch.cat([
-            input_ids[0],
-            torch.tensor(generated_ids, device=self.device, dtype=torch.long)
-        ])
+        if past_key_values is not None and isinstance(past_key_values, DynamicCache):
+            for key_cache in past_key_values.key_cache:
+                if key_cache is not None:
+                    layer_cache_lengths.append(key_cache.shape[-2])
+                else:
+                    layer_cache_lengths.append(0)
         
-        # 解码
-        full_text = self.tokenizer.decode(decode_ids, skip_special_tokens=True)
-        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        total_expected_tokens = final_seq_len
+        total_actual_tokens = sum(layer_cache_lengths) / len(layer_cache_lengths) if layer_cache_lengths else 0
         
-        if verbose:
-            print(f"生成完成，用时: {generation_time:.2f}秒")
-            print(f"总共删除了 {total_removed} 个token")
-        
-        # 获取token权重信息
-        token_weights_info = None
-        if return_attention_weights:
-            token_weights_info = self.get_detailed_token_weights(decode_ids)
+        total_cache_entries = final_seq_len * self.num_layers
+        cache_deletion_percentage = (total_cache_deletions / total_cache_entries) * 100 if total_cache_entries > 0 else 0
         
         return {
-            'full_text': full_text,
-            'generated_text': generated_text,
-            'num_tokens': len(generated_ids),
-            'generation_time': generation_time,
-            'memory_stats': self.memory_manager.get_all_stats(),
-            'token_weights': token_weights_info,
+            'generated_ids': generated_ids,
             'attention_weights_history': attention_weights_history,
-            'total_removed_tokens': total_removed,
-            'generation_mode': 'sparse_delete'
+            'deletion_events': deletion_events,
+            'cache_deletion_percentage': cache_deletion_percentage,
+            'total_cache_entries': total_cache_entries,
+            'total_cache_deletions': total_cache_deletions,
+            'layer_cache_lengths': layer_cache_lengths,
+            'min_cache_length': min(layer_cache_lengths) if layer_cache_lengths else 0,
+            'max_cache_length': max(layer_cache_lengths) if layer_cache_lengths else 0,
+            'total_expected_tokens': total_expected_tokens,
+            'total_actual_tokens': total_actual_tokens
+        }
+    
+    def _adjust_memory_for_layer(self, layer_idx: int, positions_to_delete: List[int]) -> None:
+        """Adjust memory manager for a specific layer after token deletion"""
+        if not positions_to_delete:
+            return
+        
+        layer_memories = self.memory_manager.layer_memories[layer_idx]
+        deleted_positions = sorted(set(positions_to_delete))
+        
+        # Create new memory dictionary with adjusted positions
+        new_layer_memories = {}
+        
+        for old_pos, memory in list(layer_memories.items()):
+            # Count how many positions before this one were deleted
+            positions_deleted_before = sum(1 for dp in deleted_positions if dp < old_pos)
+            
+            # Calculate new position
+            new_pos = old_pos - positions_deleted_before
+            
+            # Only keep if the position itself wasn't deleted
+            if old_pos not in deleted_positions and new_pos >= 0:
+                new_layer_memories[new_pos] = memory
+        
+        self.memory_manager.layer_memories[layer_idx] = new_layer_memories
+
+    def _common_generation_loop(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        force_exact_length: bool,
+        verbose: bool,
+        generation_mode: str,
+        return_attention_weights: bool = False,
+        hard_delete_threshold: float = 0.01
+    ) -> Dict[str, Any]:
+        """Common generation loop shared by all generation modes"""
+        generated_ids = []
+        current_ids = input_ids
+        past_key_values = None
+        attention_weights_history = [] if return_attention_weights else None
+        
+        # Track cache deletion statistics for memory_enhanced mode
+        total_cache_entries = 0  # Total cache entries (tokens * layers)
+        total_cache_deletions = 0  # Total deleted cache entries across all layers
+        deletion_events = []
+        
+        # For memory_enhanced, we need to track the full sequence to handle deletions
+        full_sequence_ids = input_ids.clone() if generation_mode == "memory_enhanced" else None
+        
+        for step in range(max_new_tokens):
+            # Get current sequence length
+            if step == 0:
+                seq_len = current_ids.shape[1]
+            else:
+                seq_len = len(generated_ids) + input_ids.shape[1]
+            
+            # Apply memory modifications based on generation mode
+            if generation_mode == "memory_enhanced" and past_key_values is not None:
+                # For memory modes, we need to track actual cache size
+                if isinstance(past_key_values, DynamicCache):
+                    actual_cache_len = past_key_values.get_seq_length() if past_key_values.get_seq_length() > 0 else seq_len
+                else:
+                    # past_key_values[0] 是 (key_cache, value_cache) tuple
+                    if past_key_values and len(past_key_values) > 0 and past_key_values[0][0] is not None:
+                        actual_cache_len = past_key_values[0][0].shape[2]
+                    else:
+                        actual_cache_len = seq_len
+                
+                # Get memory weights for current cache length
+                cache_weights = self._get_memory_weights(actual_cache_len)
+                
+                # For memory_enhanced mode: apply memory weights directly
+                past_key_values = self._apply_memory_to_past_kv_enhanced(
+                    past_key_values, cache_weights
+                )
+                
+                # Identify tokens to delete per layer based on memory weights
+                tokens_to_delete_per_layer = self._identify_tokens_to_delete_per_layer(
+                    actual_cache_len, cache_weights, hard_delete_threshold
+                )
+                
+                # Calculate total deletions and statistics
+                total_tokens_deleted = sum(len(layer_deletions) for layer_deletions in tokens_to_delete_per_layer)
+                
+                if total_tokens_deleted > 0:
+                    # Calculate unique tokens that any layer wants to delete
+                    all_deleted_tokens = set()
+                    for layer_deletions in tokens_to_delete_per_layer:
+                        all_deleted_tokens.update(layer_deletions)
+                    unique_tokens_deleted = len(all_deleted_tokens)
+                    
+                    # Count cache deletions across all layers (for statistics)
+                    cache_deletions_this_step = total_tokens_deleted
+                    total_cache_deletions += cache_deletions_this_step
+                    
+                    deletion_events.append({
+                        'step': step,
+                        'tokens_deleted': unique_tokens_deleted,
+                        'cache_deletions': cache_deletions_this_step,
+                        'layers_affected': sum(1 for layer in tokens_to_delete_per_layer if layer),
+                        'per_layer_deletions': [len(layer) for layer in tokens_to_delete_per_layer]
+                    })
+                    
+                    if verbose and step < 5:
+                        layer_stats = [len(layer) for layer in tokens_to_delete_per_layer]
+                        print(f"Step {step}: Per-layer analysis: {layer_stats[:5]}{'...' if len(layer_stats) > 5 else ''} tokens")
+                        print(f"  Consensus deletion: {unique_tokens_deleted} tokens (union of all layers)")
+                        # Show detailed per-layer deletion info
+                        different_layers = []
+                        for i in range(min(5, len(tokens_to_delete_per_layer))):
+                            if tokens_to_delete_per_layer[i]:
+                                different_layers.append(f"L{i}:{len(tokens_to_delete_per_layer[i])}")
+                        if different_layers:
+                            print(f"  Layers with deletions: {', '.join(different_layers)}")
+                    
+                    # 使用per-layer attention masks实现软删除（每层独立）
+                    if any(layer_deletions for layer_deletions in tokens_to_delete_per_layer):
+                        # 生成每层独立的attention masks
+                        per_layer_masks = self._generate_per_layer_attention_masks(
+                            actual_cache_len, tokens_to_delete_per_layer, self.device
+                        )
+                        
+                        # 存储masks以供forward使用
+                        if not hasattr(self, '_current_per_layer_masks'):
+                            self._current_per_layer_masks = per_layer_masks
+                        else:
+                            self._current_per_layer_masks = per_layer_masks
+            
+            # Forward propagation
+            forward_kwargs = {
+                "input_ids": current_ids,
+                "use_cache": True,
+                "return_dict": True,
+                "output_attentions": generation_mode != "baseline"  # Only for memory modes
+            }
+            
+            # 检查各层cache长度以进行调试
+            if generation_mode == "memory_enhanced" and past_key_values is not None:
+                cache_lengths = []
+                if isinstance(past_key_values, DynamicCache):
+                    for layer_idx in range(len(past_key_values.key_cache)):
+                        key_cache = past_key_values.key_cache[layer_idx]
+                        if key_cache is not None and hasattr(key_cache, 'shape'):
+                            cache_lengths.append(key_cache.shape[2])
+                        else:
+                            cache_lengths.append(0)
+                
+                unique_lengths = len(set(cache_lengths))
+                if verbose and step < 5:
+                    print(f"  DEBUG: Cache lengths before forward: {cache_lengths[:5]}{'...' if len(cache_lengths) > 5 else ''}")
+                    print(f"  DEBUG: Unique lengths: {unique_lengths}")
+            
+            # 对于memory_enhanced模式，使用per-layer masks来实现软删除
+            if generation_mode == "memory_enhanced" and hasattr(self, '_current_per_layer_masks'):
+                outputs = self._forward_with_per_layer_masks(
+                    input_ids=current_ids,
+                    past_key_values=past_key_values,
+                    per_layer_masks=self._current_per_layer_masks,
+                    output_attentions=generation_mode != "baseline"
+                )
+            else:
+                # baseline模式或没有masks时使用标准forward
+                forward_kwargs["past_key_values"] = past_key_values
+                outputs = self.model(**forward_kwargs)
+            
+            # Update past_key_values
+            past_key_values = outputs.past_key_values
+            
+            # Update memory (only for memory-enhanced modes)
+            if generation_mode != "baseline" and outputs.attentions is not None:
+                # Efficient batch processing of attention weights
+                layer_attentions = [
+                    layer_attn[0, :, -1, :].mean(dim=0, keepdim=True) 
+                    for layer_attn in outputs.attentions
+                ]
+                
+                # Update memory for all layers
+                self.memory_manager.update_all_layer_memories(layer_attentions)
+                
+                # Record attention history (if needed)
+                if return_attention_weights and attention_weights_history is not None:
+                    # Keep GPU tensor, avoid CPU conversion
+                    attention_data = [attn.squeeze().detach() for attn in layer_attentions]
+                    attention_weights_history.append({
+                        'step': step,
+                        'seq_len': seq_len,
+                        'layer_weights': attention_data
+                    })
+            
+            # Get logits of the last token
+            logits = outputs.logits[0, -1, :]
+            
+            # Sample next token
+            next_token_id = self._sample_next_token(
+                logits, temperature, do_sample, top_k, top_p
+            )
+            
+            generated_ids.append(next_token_id)
+            
+            # Check if finished
+            if next_token_id == self.tokenizer.eos_token_id and not force_exact_length:
+                if verbose:
+                    print(f"Encountered EOS token, ending early")
+                break
+            
+            # Update input (only pass new token)
+            current_ids = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
+            
+            # Update full sequence for memory_enhanced mode
+            if generation_mode == "memory_enhanced" and full_sequence_ids is not None:
+                full_sequence_ids = torch.cat([full_sequence_ids, current_ids], dim=1)
+            
+            # Time step progression for memory modes
+            if generation_mode != "baseline":
+                self.memory_manager.step_all_memories()
+                
+                # Clear cache to get latest memory weights
+                self._cached_memory_weights = None
+                self._cached_attention_mask = None
+            
+            if verbose and (step + 1) % 10 == 0:
+                print(f"Generated {step + 1} tokens")
+        
+        # Calculate cache deletion percentage and layer statistics for memory_enhanced mode
+        cache_deletion_percentage = 0.0
+        layer_cache_lengths = []
+        total_expected_tokens = 0
+        total_actual_tokens = 0
+        
+        # Initialize cache length variables
+        min_cache_length = 0
+        max_cache_length = 0
+        
+        if generation_mode == "memory_enhanced":
+            # Calculate total expected tokens and actual cache lengths per layer
+            final_seq_len = input_ids.shape[1] + len(generated_ids)
+            total_expected_tokens = final_seq_len
+            
+            # Get actual cache lengths from past_key_values if available
+            if past_key_values is not None:
+                if isinstance(past_key_values, DynamicCache):
+                    # Handle DynamicCache
+                    for layer_idx in range(len(past_key_values.key_cache)):
+                        key_cache = past_key_values.key_cache[layer_idx]
+                        if key_cache is not None and hasattr(key_cache, 'shape'):
+                            actual_length = key_cache.shape[2]
+                        else:
+                            actual_length = 0
+                        layer_cache_lengths.append(actual_length)
+                        total_actual_tokens += actual_length
+                else:
+                    # Handle tuple format
+                    for layer_idx, layer_cache in enumerate(past_key_values):
+                        if isinstance(layer_cache, tuple) and len(layer_cache) == 2:
+                            key_cache, value_cache = layer_cache
+                            if key_cache is not None and hasattr(key_cache, 'shape'):
+                                actual_length = key_cache.shape[2]
+                            else:
+                                actual_length = 0
+                        else:
+                            # 不是标准tuple格式，假设长度为0
+                            actual_length = 0
+                        layer_cache_lengths.append(actual_length)
+                        total_actual_tokens += actual_length
+                
+                # Debug: Show cache lengths for verification
+                if verbose and len(layer_cache_lengths) >= 3:
+                    unique_lengths = len(set(layer_cache_lengths))
+                    print(f"🔍 Final cache lengths: Layer 0={layer_cache_lengths[0]}, Layer 1={layer_cache_lengths[1]}, Layer 2={layer_cache_lengths[2]} | {unique_lengths} unique lengths")
+                    
+                    # Show per-layer deletion analysis if we had deletion events
+                    if deletion_events:
+                        total_per_layer = [0] * len(layer_cache_lengths)
+                        for event in deletion_events:
+                            per_layer = event.get('per_layer_deletions', [])
+                            for i, count in enumerate(per_layer):
+                                if i < len(total_per_layer):
+                                    total_per_layer[i] += count
+                        
+                        # Show which layers wanted to delete more tokens
+                        layer_analysis = []
+                        for i in range(min(5, len(total_per_layer))):
+                            if total_per_layer[i] > 0:
+                                layer_analysis.append(f"L{i}:{total_per_layer[i]}")
+                        
+                        if layer_analysis:
+                            print(f"📊 Per-layer deletion desires: {', '.join(layer_analysis)}")
+                
+                # Calculate average actual tokens across all layers
+                if layer_cache_lengths:
+                    total_actual_tokens = total_actual_tokens / len(layer_cache_lengths)
+                    min_cache_length = min(layer_cache_lengths)
+                    max_cache_length = max(layer_cache_lengths)
+                else:
+                    min_cache_length = 0
+                    max_cache_length = 0
+            else:
+                # If no past_key_values, assume all layers have full length
+                layer_cache_lengths = [final_seq_len] * self.num_layers
+                total_actual_tokens = final_seq_len
+                min_cache_length = final_seq_len
+                max_cache_length = final_seq_len
+            
+            # Calculate total cache entries and deletion percentage
+            total_cache_entries = final_seq_len * self.num_layers
+            if total_cache_entries > 0:
+                cache_deletion_percentage = (total_cache_deletions / total_cache_entries) * 100
+        
+        return {
+            'generated_ids': generated_ids,
+            'attention_weights_history': attention_weights_history,
+            'deletion_events': deletion_events if generation_mode == "memory_enhanced" else None,
+            'cache_deletion_percentage': cache_deletion_percentage if generation_mode == "memory_enhanced" else 0.0,
+            'total_cache_entries': total_cache_entries if generation_mode == "memory_enhanced" else 0,
+            'total_cache_deletions': total_cache_deletions if generation_mode == "memory_enhanced" else 0,
+            'layer_cache_lengths': layer_cache_lengths if generation_mode == "memory_enhanced" else [],
+            'min_cache_length': min_cache_length if generation_mode == "memory_enhanced" else 0,
+            'max_cache_length': max_cache_length if generation_mode == "memory_enhanced" else 0,
+            'total_expected_tokens': total_expected_tokens if generation_mode == "memory_enhanced" else 0,
+            'total_actual_tokens': total_actual_tokens if generation_mode == "memory_enhanced" else 0
         }
 
     @torch.no_grad()
@@ -645,69 +968,37 @@ class EbbinghausLLM:
         top_p: float = 0.9,
         verbose: bool = True,
         force_exact_length: bool = False,
-    ):
-        """标准生成方法，使用forward实现"""
-        # 准备输入
+    ) -> Dict[str, Any]:
+        """Standard generation method, implemented using forward"""
+        # Prepare input
         inputs = self.prepare_input(input_text)
         input_ids = inputs["input_ids"]
         
         start_time = time.time()
         if verbose:
-            print(f"开始基线生成，输入长度: {input_ids.shape[1]}")
+            print(f"Starting baseline generation, input length: {input_ids.shape[1]}")
         
-        generated_ids = []
-        current_ids = input_ids
-        past_key_values = None
+        # Use common generation loop
+        result = self._common_generation_loop(
+            input_ids, max_new_tokens, temperature, do_sample, top_k, top_p,
+            force_exact_length, verbose, "baseline", False
+        )
         
-        for step in range(max_new_tokens):
-            # 前向传播
-            outputs = self.model(
-                input_ids=current_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-                return_dict=True,
-                output_attentions=True
-            )
-            
-            # 更新past_key_values
-            past_key_values = outputs.past_key_values
-            
-            # 获取最后一个token的logits
-            logits = outputs.logits[0, -1, :]
-            
-            # 采样下一个token
-            next_token_id = self._sample_next_token_fast(
-                logits, temperature, do_sample, top_k, top_p
-            )
-            
-            generated_ids.append(next_token_id)
-            
-            # 检查是否结束
-            if next_token_id == self.tokenizer.eos_token_id and not force_exact_length:
-                if verbose:
-                    print(f"遇到EOS token，提前结束")
-                break
-            
-            # 更新输入（只传入新token）
-            current_ids = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
-            
-            if verbose and (step + 1) % 10 == 0:
-                print(f"已生成 {step + 1} tokens")
-        
+        generated_ids = result['generated_ids']
         generation_time = time.time() - start_time
         
-        # 构建完整序列
+        # Build complete sequence
         full_ids = torch.cat([
             input_ids[0],
             torch.tensor(generated_ids, device=self.device, dtype=torch.long)
         ])
         
-        # 解码
+        # Decode
         full_text = self.tokenizer.decode(full_ids, skip_special_tokens=True)
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         
         if verbose:
-            print(f"生成完成，用时: {generation_time:.2f}秒")
+            print(f"Generation completed, time taken: {generation_time:.2f} seconds")
         
         return {
             'full_text': full_text,
@@ -717,144 +1008,9 @@ class EbbinghausLLM:
             'generation_mode': 'baseline'
         }
 
-    @torch.no_grad()
-    def generate_soft_delete(
-        self,
-        input_text: str,
-        max_new_tokens: int = 100,
-        temperature: float = 0.7,
-        do_sample: bool = True,
-        top_k: int = 0,
-        top_p: float = 0.9,
-        return_attention_weights: bool = False,
-        verbose: bool = True,
-        force_exact_length: bool = False,
-    ):
-        """软删除生成方法，动态修改past_key_values"""
-        # 准备输入
-        inputs = self.prepare_input(input_text)
-        input_ids = inputs["input_ids"]
-        
-        # 初始化记忆管理器
-        self.memory_manager = EbbinghausMemoryManager(self.num_layers)
-        
-        start_time = time.time()
-        if verbose:
-            print(f"开始软删除生成，输入长度: {input_ids.shape[1]}")
-        
-        generated_ids = []
-        current_ids = input_ids
-        past_key_values = None
-        attention_weights_history = [] if return_attention_weights else None
-        
-        for step in range(max_new_tokens):
-            # 获取当前序列长度
-            if step == 0:
-                seq_len = current_ids.shape[1]
-            else:
-                seq_len = len(generated_ids) + input_ids.shape[1]
-            
-            # 快速获取和应用记忆权重
-            memory_weights = self._get_memory_weights_fast(seq_len)
-            
-            if past_key_values is not None:
-                past_key_values = self._apply_memory_to_past_kv_fast(past_key_values, memory_weights)
-            
-            # 前向传播
-            outputs = self.model(
-                input_ids=current_ids,
-                past_key_values=past_key_values,
-                use_cache=True,
-                output_attentions=True,  # 必须为True以更新记忆
-                return_dict=True
-            )
-            
-            # 更新past_key_values
-            past_key_values = outputs.past_key_values
-            
-            # 每个token都必须更新记忆（艾宾浩斯核心逻辑）
-            if outputs.attentions is not None:
-                # 高效的批量处理attention weights
-                layer_attentions = [
-                    layer_attn[0, :, -1, :].mean(dim=0, keepdim=True) 
-                    for layer_attn in outputs.attentions
-                ]
-                
-                # 更新所有层的记忆
-                self.memory_manager.update_all_layer_memories_batch(layer_attentions)
-                
-                # 记录注意力历史（如果需要）
-                if return_attention_weights and attention_weights_history is not None:
-                    # 保持GPU tensor，避免CPU转换
-                    attention_data = [attn.squeeze().detach() for attn in layer_attentions]
-                    attention_weights_history.append({
-                        'step': step,
-                        'seq_len': seq_len,
-                        'layer_weights': attention_data
-                    })
-            
-            # 获取最后一个token的logits
-            logits = outputs.logits[0, -1, :]
-            
-            # 采样下一个token
-            next_token_id = self._sample_next_token_fast(
-                logits, temperature, do_sample, top_k, top_p
-            )
-            
-            generated_ids.append(next_token_id)
-            
-            # 检查是否结束
-            if next_token_id == self.tokenizer.eos_token_id and not force_exact_length:
-                if verbose:
-                    print(f"遇到EOS token，提前结束")
-                break
-            
-            # 更新输入（只传入新token）
-            current_ids = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
-            
-            # 每个token都必须进行时间步进（艾宾浩斯核心）
-            self.memory_manager.step_all_memories()
-            
-            # 清除缓存以获取最新的记忆权重
-            self._cached_memory_weights = None
-            self._cached_attention_mask = None
-            
-            if verbose and (step + 1) % 10 == 0:
-                print(f"已生成 {step + 1} tokens")
-        
-        generation_time = time.time() - start_time
-        
-        # 构建完整序列
-        full_ids = torch.cat([
-            input_ids[0],
-            torch.tensor(generated_ids, device=self.device, dtype=torch.long)
-        ])
-        
-        # 解码
-        full_text = self.tokenizer.decode(full_ids, skip_special_tokens=True)
-        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        
-        if verbose:
-            print(f"生成完成，用时: {generation_time:.2f}秒")
-        
-        # 获取token权重信息
-        token_weights_info = None
-        if return_attention_weights:
-            token_weights_info = self.get_detailed_token_weights(full_ids)
-        
-        return {
-            'full_text': full_text,
-            'generated_text': generated_text,
-            'num_tokens': len(generated_ids),
-            'generation_time': generation_time,
-            'memory_stats': self.memory_manager.get_all_stats(),
-            'token_weights': token_weights_info,
-            'attention_weights_history': attention_weights_history,
-            'generation_mode': 'soft_delete'
-        }
 
     @torch.no_grad()
-    def generate_sparse_attention(
+    def generate_memory_enhanced(
         self,
         input_text: str,
         max_new_tokens: int = 100,
@@ -863,123 +1019,68 @@ class EbbinghausLLM:
         top_k: int = 0,
         top_p: float = 0.9,
         return_attention_weights: bool = False,
-        verbose: bool = True,
+verbose: bool = True,
         force_exact_length: bool = False,
-    ):
-        """稀疏注意力生成方法，动态生成attention_mask"""
-        # 准备输入
+        hard_delete_threshold: float = 0.01,  # Threshold for hard deletion
+    ) -> Dict[str, Any]:
+        """Memory-enhanced generation combining soft delete and hard deletion
+        
+        This method:
+        1. Uses Ebbinghaus memory manager to track memory for each token in each layer
+        2. Applies soft delete by adjusting cache weights (clamp to [soft_delete_threshold, 1.0])
+        3. Hard deletes tokens when weight < hard_delete_threshold from cache
+        4. Stops updating memory for deleted tokens
+        5. Supports variable-length cache per layer
+        """
+        # Prepare input
         inputs = self.prepare_input(input_text)
         input_ids = inputs["input_ids"]
         
-        # 初始化记忆管理器
+        # Initialize memory manager
         self.memory_manager = EbbinghausMemoryManager(self.num_layers)
         
         start_time = time.time()
         if verbose:
-            print(f"开始稀疏注意力生成，输入长度: {input_ids.shape[1]}")
+            print(f"Starting memory-enhanced generation, input length: {input_ids.shape[1]}")
         
-        generated_ids = []
-        current_ids = input_ids
-        past_key_values = None
-        attention_weights_history = [] if return_attention_weights else None
+        # Use hard deletion generation loop
+        result = self._hard_delete_generation_loop(
+            input_ids, max_new_tokens, temperature, do_sample, top_k, top_p,
+            force_exact_length, verbose, return_attention_weights,
+            hard_delete_threshold=hard_delete_threshold
+        )
         
-        for step in range(max_new_tokens):
-            # 获取当前序列长度
-            if step == 0:
-                seq_len = current_ids.shape[1]
-            else:
-                seq_len = len(generated_ids) + input_ids.shape[1]
-            
-            # 快速获取记忆权重和生成mask
-            memory_weights = self._get_memory_weights_fast(seq_len)
-            attention_mask = self._generate_dynamic_attention_mask_fast(seq_len, memory_weights)
-            
-            if verbose and step < 3 and attention_mask is not None:
-                masked_count = (attention_mask == 0).sum().item()
-                print(f"Step {step}: masking {masked_count}/{seq_len} positions")
-            
-            # 前向传播
-            outputs = self.model(
-                input_ids=current_ids,
-                past_key_values=past_key_values,
-                attention_mask=attention_mask,
-                use_cache=True,
-                output_attentions=True,  # 必须为True以更新记忆
-                return_dict=True
-            )
-            
-            # 更新past_key_values
-            past_key_values = outputs.past_key_values
-            
-            # 每个token都必须更新记忆（艾宾浩斯核心逻辑）
-            if outputs.attentions is not None:
-                # 高效的批量处理attention weights
-                layer_attentions = [
-                    layer_attn[0, :, -1, :].mean(dim=0, keepdim=True) 
-                    for layer_attn in outputs.attentions
-                ]
-                
-                # 更新所有层的记忆
-                self.memory_manager.update_all_layer_memories_batch(layer_attentions)
-                
-                # 记录注意力历史（如果需要）
-                if return_attention_weights and attention_weights_history is not None:
-                    # 保持GPU tensor，避免CPU转换
-                    attention_data = [attn.squeeze().detach() for attn in layer_attentions]
-                    attention_weights_history.append({
-                        'step': step,
-                        'seq_len': seq_len,
-                        'layer_weights': attention_data
-                    })
-            
-            # 获取最后一个token的logits
-            logits = outputs.logits[0, -1, :]
-            
-            # 采样下一个token
-            next_token_id = self._sample_next_token_fast(
-                logits, temperature, do_sample, top_k, top_p
-            )
-            
-            generated_ids.append(next_token_id)
-            
-            # 检查是否结束
-            if next_token_id == self.tokenizer.eos_token_id and not force_exact_length:
-                if verbose:
-                    print(f"遇到EOS token，提前结束")
-                break
-            
-            # 更新输入（只传入新token）
-            current_ids = torch.tensor([[next_token_id]], device=self.device, dtype=torch.long)
-            
-            # 每个token都必须进行时间步进（艾宾浩斯核心）
-            self.memory_manager.step_all_memories()
-            
-            # 清除缓存以获取最新的记忆权重
-            self._cached_memory_weights = None
-            self._cached_attention_mask = None
-            
-            if verbose and (step + 1) % 10 == 0:
-                print(f"已生成 {step + 1} tokens")
-        
+        generated_ids = result['generated_ids']
+        attention_weights_history = result['attention_weights_history']
+        deletion_events = result['deletion_events']
+        cache_deletion_percentage = result['cache_deletion_percentage']
+        total_cache_entries = result['total_cache_entries']
+        total_cache_deletions = result['total_cache_deletions']
+        layer_cache_lengths = result['layer_cache_lengths']
+        total_expected_tokens = result['total_expected_tokens']
+        total_actual_tokens = result['total_actual_tokens']
         generation_time = time.time() - start_time
         
-        # 构建完整序列
+        # Build complete sequence
         full_ids = torch.cat([
             input_ids[0],
             torch.tensor(generated_ids, device=self.device, dtype=torch.long)
         ])
         
-        # 解码
+        # Decode
         full_text = self.tokenizer.decode(full_ids, skip_special_tokens=True)
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         
         if verbose:
-            print(f"生成完成，用时: {generation_time:.2f}秒")
+            print(f"Generation completed, time taken: {generation_time:.2f} seconds")
+            if cache_deletion_percentage > 0:
+                print(f"Cache deletion percentage: {cache_deletion_percentage:.2f}% ({total_cache_deletions}/{total_cache_entries})")
+            print(f"Expected tokens: {total_expected_tokens}, Average actual tokens per layer: {total_actual_tokens:.1f}")
         
-        # 获取token权重信息
+        # Get token weight information
         token_weights_info = None
         if return_attention_weights:
-            token_weights_info = self.get_detailed_token_weights(full_ids)
+            token_weights_info = self.get_token_weight_details(full_ids)
         
         return {
             'full_text': full_text,
@@ -989,8 +1090,17 @@ class EbbinghausLLM:
             'memory_stats': self.memory_manager.get_all_stats(),
             'token_weights': token_weights_info,
             'attention_weights_history': attention_weights_history,
-            'generation_mode': 'sparse_attention'
+            'generation_mode': 'memory_enhanced',
+            # Cache deletion statistics
+            'deletion_events': deletion_events,
+            'cache_deletion_percentage': cache_deletion_percentage,
+            'total_cache_entries': total_cache_entries,
+            'total_cache_deletions': total_cache_deletions,
+            'layer_cache_lengths': layer_cache_lengths,
+            'total_expected_tokens': total_expected_tokens,
+            'total_actual_tokens': total_actual_tokens
         }
+
 
     @torch.no_grad()
     def generate(
@@ -1003,89 +1113,22 @@ class EbbinghausLLM:
         top_p: float = 0.9,
         return_attention_weights: bool = False,
         verbose: bool = True,
-        generation_mode: str = "baseline",  # "baseline", "soft_delete", "sparse_attention"
+        generation_mode: str = "baseline",  # "baseline", "memory_enhanced"
         force_exact_length: bool = False,
-    ):
-        """统一的生成接口"""
+        hard_delete_threshold: float = 0.01,  # Threshold for hard deletion
+    ) -> Dict[str, Any]:
+        """Unified generation interface"""
         
         if generation_mode == "baseline":
             return self.generate_baseline(
                 input_text, max_new_tokens, temperature, do_sample, top_k, top_p, verbose,
                 force_exact_length
             )
-        elif generation_mode == "soft_delete":
-            return self.generate_soft_delete(
+        elif generation_mode == "memory_enhanced":
+            return self.generate_memory_enhanced(
                 input_text, max_new_tokens, temperature, do_sample, top_k, top_p, 
-                return_attention_weights, verbose, force_exact_length
-            )
-        elif generation_mode == "sparse_attention":
-            return self.generate_sparse_attention(
-                input_text, max_new_tokens, temperature, do_sample, top_k, top_p, 
-                return_attention_weights, verbose, force_exact_length
-            )
-        elif generation_mode == "sparse_delete":
-            return self.generate_sparse_delete(
-                input_text, max_new_tokens, temperature, do_sample, top_k, top_p, 
-                return_attention_weights, verbose, force_exact_length
+                return_attention_weights, verbose, force_exact_length, hard_delete_threshold
             )
         else:
-            raise ValueError(f"Unknown generation_mode: {generation_mode}. Available modes: baseline, soft_delete, sparse_attention, sparse_delete")
+            raise ValueError(f"Unknown generation_mode: {generation_mode}. Available modes: baseline, memory_enhanced")
 
-    @torch.no_grad()
-    def generate_standard(
-            self,
-            input_text: str,
-            max_new_tokens: int = 100,
-            temperature: float = 0.7,
-            do_sample: bool = True,
-            top_p: float = 0.9,
-            verbose: bool = True,
-            **kwargs
-    ):
-        """标准生成（用于对比）"""
-        inputs = self.prepare_input(input_text)
-
-        if verbose:
-            print(f"标准生成开始，输入长度: {inputs['input_ids'].shape[1]}")
-
-        start_time = time.time()
-        
-        # 准备生成参数，过滤掉不支持的参数
-        generate_kwargs = {
-            'max_new_tokens': max_new_tokens,
-            'temperature': temperature,
-            'do_sample': do_sample,
-            'pad_token_id': self.tokenizer.pad_token_id,
-            'eos_token_id': self.tokenizer.eos_token_id,
-        }
-        
-        # 只在支持时添加top_p
-        if do_sample and top_p < 1.0:
-            generate_kwargs['top_p'] = top_p
-            
-        # 添加其他安全的kwargs
-        safe_kwargs = ['num_beams', 'length_penalty', 'repetition_penalty']
-        for key, value in kwargs.items():
-            if key in safe_kwargs:
-                generate_kwargs[key] = value
-        
-        outputs = self.model.generate(
-            **inputs,
-            **generate_kwargs
-        )
-        generation_time = time.time() - start_time
-
-        if verbose:
-            print(f"标准生成完成，用时: {generation_time:.2f}秒")
-
-        generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        response_text = self.tokenizer.decode(
-            outputs[0][len(inputs["input_ids"][0]):], skip_special_tokens=True
-        )
-
-        return {
-            'full_text': generated_text,
-            'generated_text': response_text,
-            'num_tokens': outputs[0].shape[0] - inputs["input_ids"].shape[1],
-            'generation_time': generation_time
-        }
