@@ -27,7 +27,7 @@ class LayerTokenMemory:
 
     def step_time(self) -> None:
         """Time step progression"""
-        self.time_steps += 0.04  # Increase time step to make forgetting faster for demonstration
+        self.time_steps += 0.01  # Increase time step to make forgetting faster for demonstration
 
 
 class EbbinghausMemoryManager:

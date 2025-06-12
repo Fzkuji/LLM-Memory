@@ -6,7 +6,7 @@ import time
 from typing import Dict, List, Optional, Any
 import warnings
 
-from .memory import EbbinghausMemoryManager
+from .memory_efficient import EfficientEbbinghausMemoryManager
 # from .model import VariableLengthCache, VariableLengthModel  # 不再使用
 
 warnings.filterwarnings('ignore')
@@ -87,7 +87,7 @@ class EbbinghausLLM:
         print(f"Model loaded on device: {self.device}, layers: {self.num_layers}")
 
         # Initialize memory manager
-        self.memory_manager = EbbinghausMemoryManager(self.num_layers)
+        self.memory_manager = EfficientEbbinghausMemoryManager(self.num_layers)
         
         # Performance optimization cache
         self._cached_memory_weights = None
@@ -135,14 +135,16 @@ class EbbinghausLLM:
             }
             
             for pos in range(seq_len):
-                if pos in self.memory_manager.layer_memories[layer_idx]:
-                    memory = self.memory_manager.layer_memories[layer_idx][pos]
-                    retention = memory.get_retention_weight()
+                memory_info = self.memory_manager.get_token_memory_info(layer_idx, pos)
+                if memory_info:
+                    retention = memory_info['retention']
+                    strength = memory_info['strength']
+                    time_steps = memory_info['time_steps']
                     
                     layer_info['retention_weights'].append(round(retention, 4))
-                    layer_info['memory_strength'].append(round(memory.strength, 4))
-                    layer_info['time_steps'].append(memory.time_steps)
-                    layer_info['memory_formula'].append(f"e^(-{memory.time_steps}/{memory.strength:.2f}) = {retention:.4f}")
+                    layer_info['memory_strength'].append(round(strength, 4))
+                    layer_info['time_steps'].append(time_steps)
+                    layer_info['memory_formula'].append(f"e^(-{time_steps}/{strength:.2f}) = {retention:.4f}")
                 else:
                     layer_info['retention_weights'].append(1.0)
                     layer_info['memory_strength'].append(1.0)
@@ -232,25 +234,9 @@ class EbbinghausLLM:
         for layer_idx in range(self.num_layers):
             if layer_idx >= len(tokens_to_delete_per_layer) or not tokens_to_delete_per_layer[layer_idx]:
                 continue
-                
-            layer_memories = self.memory_manager.layer_memories[layer_idx]
-            deleted_positions = sorted(set(tokens_to_delete_per_layer[layer_idx]))
             
-            # Create new memory dictionary with adjusted positions
-            new_layer_memories = {}
-            
-            for old_pos, memory in list(layer_memories.items()):
-                # Count how many positions before this one were deleted
-                positions_deleted_before = sum(1 for dp in deleted_positions if dp < old_pos)
-                
-                # Calculate new position
-                new_pos = old_pos - positions_deleted_before
-                
-                # Only keep if the position itself wasn't deleted
-                if old_pos not in deleted_positions and new_pos >= 0:
-                    new_layer_memories[new_pos] = memory
-            
-            self.memory_manager.layer_memories[layer_idx] = new_layer_memories
+            # Use the new adjust_positions_after_deletion method
+            self.memory_manager.adjust_positions_after_deletion(layer_idx, tokens_to_delete_per_layer[layer_idx])
     
     
     def _identify_tokens_to_delete_per_layer(
@@ -281,26 +267,9 @@ class EbbinghausLLM:
         if not tokens_to_delete:
             return
         
-        # Create position mapping
-        deleted_positions = set(tokens_to_delete)
-        position_mapping = {}
-        new_idx = 0
-        for old_idx in range(original_seq_len):
-            if old_idx not in deleted_positions:
-                position_mapping[old_idx] = new_idx
-                new_idx += 1
-        
-        # Update memory positions for all layers
+        # Update all layers with the same deletion positions
         for layer_idx in range(self.num_layers):
-            layer_memories = self.memory_manager.layer_memories[layer_idx]
-            new_layer_memories = {}
-            
-            for old_pos, memory in layer_memories.items():
-                if old_pos in position_mapping:
-                    new_pos = position_mapping[old_pos]
-                    new_layer_memories[new_pos] = memory
-            
-            self.memory_manager.layer_memories[layer_idx] = new_layer_memories
+            self.memory_manager.adjust_positions_after_deletion(layer_idx, tokens_to_delete)
     
     def _hard_delete_generation_loop(
         self,
@@ -425,11 +394,12 @@ class EbbinghausLLM:
                                 print(f"  DEBUG: Layer 0 delete positions: {tokens_to_delete_per_layer[0][:10]}")
                             
                             # 检查记忆对象的状态
-                            layer0_memories = self.memory_manager.layer_memories[0]
-                            if layer0_memories:
-                                sample_pos = list(layer0_memories.keys())[0]
-                                sample_mem = layer0_memories[sample_pos]
-                                print(f"  DEBUG: Sample memory - pos={sample_pos}, strength={sample_mem.strength:.3f}, time_steps={sample_mem.time_steps:.3f}, weight={sample_mem.get_retention_weight():.6f}")
+                            # Find first active position
+                            for pos in range(current_seq_len):
+                                memory_info = self.memory_manager.get_token_memory_info(0, pos)
+                                if memory_info:
+                                    print(f"  DEBUG: Sample memory - pos={pos}, strength={memory_info['strength']:.3f}, time_steps={memory_info['time_steps']:.3f}, weight={memory_info['retention']:.6f}")
+                                    break
                     
                     # Perform hard deletion for each layer independently
                     layer_deletions = 0
@@ -531,24 +501,8 @@ class EbbinghausLLM:
         if not positions_to_delete:
             return
         
-        layer_memories = self.memory_manager.layer_memories[layer_idx]
-        deleted_positions = sorted(set(positions_to_delete))
-        
-        # Create new memory dictionary with adjusted positions
-        new_layer_memories = {}
-        
-        for old_pos, memory in list(layer_memories.items()):
-            # Count how many positions before this one were deleted
-            positions_deleted_before = sum(1 for dp in deleted_positions if dp < old_pos)
-            
-            # Calculate new position
-            new_pos = old_pos - positions_deleted_before
-            
-            # Only keep if the position itself wasn't deleted
-            if old_pos not in deleted_positions and new_pos >= 0:
-                new_layer_memories[new_pos] = memory
-        
-        self.memory_manager.layer_memories[layer_idx] = new_layer_memories
+        # Use the new adjust_positions_after_deletion method
+        self.memory_manager.adjust_positions_after_deletion(layer_idx, positions_to_delete)
     
     def _create_weighted_cache(self, past_key_values: Optional[DynamicCache], memory_weights: List[torch.Tensor]) -> Optional[DynamicCache]:
         """创建应用了记忆权重的cache副本，不修改原始cache"""
@@ -954,7 +908,7 @@ verbose: bool = True,
         input_ids = inputs["input_ids"]
         
         # Initialize memory manager
-        self.memory_manager = EbbinghausMemoryManager(self.num_layers)
+        self.memory_manager = EfficientEbbinghausMemoryManager(self.num_layers)
         
         start_time = time.time()
         if verbose:
