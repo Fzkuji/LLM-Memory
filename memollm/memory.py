@@ -21,13 +21,13 @@ class LayerTokenMemory:
     def update_memory(self, attention_weight: float) -> None:
         """Update memory parameters based on attention weight"""
         # Memory strength increases with attention weight
-        if attention_weight >= 0.05:
+        if attention_weight >= 0.01:
             self.time_steps = 0  # Reset time, extend important token's life
             self.strength += attention_weight
 
     def step_time(self) -> None:
         """Time step progression"""
-        self.time_steps += 0.05  # Increase time step to make forgetting faster for demonstration
+        self.time_steps += 0.04  # Increase time step to make forgetting faster for demonstration
 
 
 class EbbinghausMemoryManager:

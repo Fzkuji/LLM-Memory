@@ -145,7 +145,7 @@ def main():
             # 为memory_enhanced模式使用更合理的删除阈值
             kwargs = {}
             if args.mode == "memory_enhanced":
-                kwargs['hard_delete_threshold'] = 0.0  # 测试阈值为0的情况
+                kwargs['hard_delete_threshold'] = 0.05  # 测试阈值为0的情况
             
             result = llm.generate(
                 args.prompt,
